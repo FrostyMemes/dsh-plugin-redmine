@@ -38,6 +38,7 @@ const newTemplateId = (templates: Template[]) => {
   while (templates.some(template => template.id === id));
   return id;
 };
+type TemplateSaveSnapshot = { name: string; text: string; isDefault: boolean; targetId: string };
 const sanitizeLog = (log: LogEntry): LogEntry => ({
   ...log,
   component: sanitizeRuntimeText(log.component, 96),
@@ -428,9 +429,14 @@ export function RedmineSettings({ api }: PanelProps) {
   const [templateName, setTemplateName] = useState('');
   const [templateText, setTemplateText] = useState('');
   const [templateIsDefault, setTemplateIsDefault] = useState(true);
+  const [templateCreationMode, setTemplateCreationMode] = useState(false);
+  const [overwriteConfirmation, setOverwriteConfirmation] = useState<TemplateSaveSnapshot | null>(null);
+  const templateOverwriteDialog = useRef<HTMLDialogElement>(null);
+  const pendingTemplateOverwrite = useRef<TemplateSaveSnapshot | null>(null);
+  const templateSaveInFlight = useRef(false);
   const [health, setHealth] = useState<Health>();
   const soleTemplate = templates.length === 1 ? templates[0] : undefined;
-  const onlyExistingDefaultTarget = !!soleTemplate && templateName.trim() === soleTemplate.name.trim();
+  const onlyExistingDefaultTarget = !templateCreationMode && !!soleTemplate && templateName.trim() === soleTemplate.name.trim();
 
   useEffect(() => {
     let alive = true;
@@ -490,8 +496,15 @@ export function RedmineSettings({ api }: PanelProps) {
   const selectTemplate = (id: string) => {
     const selected = templates.find(template => template.id === id);
     if (!selected) return;
+    setTemplateCreationMode(false);
     setSelectedTemplateId(selected.id); setTemplateName(selected.name); setTemplateText(selected.text);
     setTemplateIsDefault(defaultTemplateId === selected.id); clearTemplateFeedback();
+  };
+  const createTemplateDraft = () => {
+    if (settingsBusy || templateSaveInFlight.current) return;
+    setTemplateCreationMode(true); setSelectedTemplateId('');
+    setTemplateName('Новый шаблон'); setTemplateText('Новый промпт'); setTemplateIsDefault(false);
+    clearTemplateFeedback();
   };
   const setTemplateDefault = (checked: boolean) => {
     clearTemplateFeedback();
@@ -503,7 +516,7 @@ export function RedmineSettings({ api }: PanelProps) {
     setTemplateIsDefault(false);
   };
   const deleteSelectedTemplate = async () => {
-    if (settingsBusy || templates.length <= 1 || !selectedTemplateId) return;
+    if (settingsBusy || templateCreationMode || templateSaveInFlight.current || templates.length <= 1 || !selectedTemplateId) return;
     clearTemplateFeedback();
     const rest = templates.filter(template => template.id !== selectedTemplateId);
     const nextDefaultId = defaultTemplateId === selectedTemplateId || !rest.some(template => template.id === defaultTemplateId) ? rest[0].id : defaultTemplateId;
@@ -518,35 +531,71 @@ export function RedmineSettings({ api }: PanelProps) {
     } catch (e) { setTemplateError(errText(e)); }
     finally { setSaving(false); }
   };
-  const saveTemplate = async () => {
-    const name = templateName.trim();
-    if (!name) { setTemplateError('Введите название шаблона.'); setTemplateMessage(''); return; }
-    if (!templateText.trim()) { setTemplateError('Введите текст промпта шаблона.'); setTemplateMessage(''); return; }
-    if (settingsBusy) return;
-    const selectedMatchesName = templates.find(template => template.id === selectedTemplateId && template.name.trim() === name);
-    const target = selectedMatchesName ?? templates.find(template => template.name.trim() === name);
-    const targetId = target?.id ?? newTemplateId(templates);
-    const savedTemplate = { id: targetId, name, text: templateText };
+  const persistTemplate = async (snapshot: TemplateSaveSnapshot) => {
+    const target = templates.find(template => template.id === snapshot.targetId);
+    const savedTemplate = { id: snapshot.targetId, name: snapshot.name, text: snapshot.text };
     const nextTemplates = target
-      ? templates.map(template => template.id === targetId ? savedTemplate : template)
+      ? templates.map(template => template.id === snapshot.targetId ? savedTemplate : template)
       : [...templates, savedTemplate];
-    const fallbackDefault = nextTemplates.find(template => template.id !== targetId)?.id ?? targetId;
-    const nextDefaultId = templateIsDefault
-      ? targetId
-      : defaultTemplateId === targetId
-        ? fallbackDefault
-        : defaultTemplateId;
+    const nextDefaultId = snapshot.isDefault
+      ? snapshot.targetId
+      : defaultTemplateId === snapshot.targetId
+        ? nextTemplates.find(template => template.id !== snapshot.targetId)?.id ?? snapshot.targetId
+        : templates.some(template => template.id === defaultTemplateId)
+          ? defaultTemplateId
+          : nextTemplates[0]?.id ?? snapshot.targetId;
 
     setSaving(true); setTemplateError(''); setTemplateMessage('');
     try {
       const saved = await api.call('configure', { templates: nextTemplates, defaultTemplateId: nextDefaultId });
       setState(saved); setHealth(saved.health); setTemplates(saved.settings.templates); setDefaultTemplateId(saved.settings.defaultTemplateId);
-      const selected = saved.settings.templates.find(template => template.id === targetId) ?? saved.settings.templates.find(template => template.id === saved.settings.defaultTemplateId) ?? saved.settings.templates[0];
+      const selected = saved.settings.templates.find(template => template.id === snapshot.targetId) ?? saved.settings.templates.find(template => template.id === saved.settings.defaultTemplateId) ?? saved.settings.templates[0];
+      setTemplateCreationMode(false);
       setSelectedTemplateId(selected?.id ?? ''); setTemplateName(selected?.name ?? ''); setTemplateText(selected?.text ?? '');
       setTemplateIsDefault(!!selected && selected.id === saved.settings.defaultTemplateId);
       setTemplateMessage('Шаблон сохранён');
     } catch (e) { setTemplateError(errText(e)); }
-    finally { setSaving(false); }
+    finally { setSaving(false); templateSaveInFlight.current = false; }
+  };
+  const saveTemplate = () => {
+    const name = templateName.trim();
+    if (!name) { setTemplateError('Введите название шаблона.'); setTemplateMessage(''); return; }
+    if (!templateText.trim()) { setTemplateError('Введите текст промпта шаблона.'); setTemplateMessage(''); return; }
+    if (settingsBusy || templateSaveInFlight.current) return;
+    const selectedMatchesName = !templateCreationMode ? templates.find(template => template.id === selectedTemplateId && template.name.trim() === name) : undefined;
+    const collision = selectedMatchesName ?? templates.find(template => template.name.trim() === name);
+    const snapshot: TemplateSaveSnapshot = {
+      name, text: templateText, isDefault: templateIsDefault,
+      targetId: collision?.id ?? newTemplateId(templates),
+    };
+    templateSaveInFlight.current = true;
+    if (collision) {
+      pendingTemplateOverwrite.current = snapshot;
+      setOverwriteConfirmation(snapshot); setTemplateError(''); setTemplateMessage('');
+      try {
+        const dialog = templateOverwriteDialog.current;
+        if (!dialog) throw new Error('Диалог подтверждения недоступен.');
+        if (!dialog.open) dialog.showModal();
+      } catch {
+        pendingTemplateOverwrite.current = null; setOverwriteConfirmation(null);
+        templateSaveInFlight.current = false;
+        setTemplateError('Не удалось открыть подтверждение перезаписи.');
+      }
+      return;
+    }
+    void persistTemplate(snapshot);
+  };
+  const cancelOverwrite = () => {
+    pendingTemplateOverwrite.current = null; setOverwriteConfirmation(null);
+    templateSaveInFlight.current = false;
+    templateOverwriteDialog.current?.close();
+  };
+  const confirmOverwrite = () => {
+    const snapshot = pendingTemplateOverwrite.current;
+    if (!snapshot || !templateSaveInFlight.current || settingsBusy) return;
+    pendingTemplateOverwrite.current = null; setOverwriteConfirmation(null);
+    templateOverwriteDialog.current?.close();
+    void persistTemplate(snapshot);
   };
 
   const normalizedUrl = (value: string) => {
@@ -580,16 +629,22 @@ export function RedmineSettings({ api }: PanelProps) {
       <p className="rm-hint">Промпт будет отправлен в новую сессию. Текст задачи и комментарии панель не загружает.</p>
       <p className="rm-hint">Доступные поля: {['{{issue.id}}', '{{issue.url}}', '{{issue.subject}}', '{{project.id}}', '{{project.name}}', '{{status}}', '{{tracker}}', '{{priority}}', '{{workspace.path}}'].map((value, index) => <React.Fragment key={value}>{index > 0 ? ', ' : ''}<code>{value}</code></React.Fragment>)}.</p>
       <article className="rm-template">
-        <div className="rm-template-title"><label className="rm-field"><span>Шаблон</span><select value={selectedTemplateId} disabled={settingsBusy || !templates.length} onChange={event => selectTemplate(event.target.value)}>{templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label></div>
-        <label className="rm-field"><span>Название шаблона</span><input value={templateName} disabled={settingsBusy} onChange={event => { const name = event.target.value; setTemplateName(name); if (soleTemplate && name.trim() === soleTemplate.name.trim()) setTemplateIsDefault(true); clearTemplateFeedback(); }}/></label>
-        <label className="rm-checkbox"><input type="checkbox" checked={templateIsDefault} disabled={settingsBusy || onlyExistingDefaultTarget} onChange={event => setTemplateDefault(event.target.checked)}/><span>Шаблон по умолчанию</span></label>
+        <div className="rm-template-title"><label className="rm-field"><span>Шаблон</span><select value={templateCreationMode ? '' : selectedTemplateId} disabled={settingsBusy || !templates.length} onChange={event => selectTemplate(event.target.value)}><option value="" disabled>{templateCreationMode ? 'Выберите сохранённый шаблон' : 'Выберите шаблон'}</option>{templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label><button className="rm-secondary" disabled={settingsBusy || !!overwriteConfirmation} onClick={createTemplateDraft}>Создать шаблон</button></div>
+        <label className="rm-field"><span>Название шаблона</span><input value={templateName} disabled={settingsBusy || !!overwriteConfirmation} onChange={event => { const name = event.target.value; setTemplateName(name); if (!templateCreationMode && soleTemplate && name.trim() === soleTemplate.name.trim()) setTemplateIsDefault(true); clearTemplateFeedback(); }}/></label>
+        <label className="rm-checkbox"><input type="checkbox" checked={templateIsDefault} disabled={settingsBusy || !!overwriteConfirmation || onlyExistingDefaultTarget} onChange={event => setTemplateDefault(event.target.checked)}/><span>Шаблон по умолчанию</span></label>
         {onlyExistingDefaultTarget && <p className="rm-hint">Единственный сохранённый шаблон должен оставаться шаблоном по умолчанию.</p>}
-        {soleTemplate && !onlyExistingDefaultTarget && !templateIsDefault && <p className="rm-hint">Новый шаблон будет сохранён без значения по умолчанию; текущий шаблон останется основным.</p>}
-        <label className="rm-field"><span>Текст промпта шаблона</span><textarea rows={5} value={templateText} disabled={settingsBusy} onChange={event => { setTemplateText(event.target.value); clearTemplateFeedback(); }}/></label>
-        <button className="rm-link-button danger" disabled={settingsBusy || templates.length <= 1} onClick={deleteSelectedTemplate}>Удалить выбранный шаблон</button>
+        {soleTemplate && !onlyExistingDefaultTarget && !templateIsDefault && <p className="rm-hint">{templateCreationMode ? 'Если новое название уникально, сохранённый шаблон останется основным.' : 'Новый шаблон будет сохранён без значения по умолчанию; текущий шаблон останется основным.'}</p>}
+        <label className="rm-field"><span>Текст промпта шаблона</span><textarea rows={5} value={templateText} disabled={settingsBusy || !!overwriteConfirmation} onChange={event => { setTemplateText(event.target.value); clearTemplateFeedback(); }}/></label>
+        <button className="rm-link-button danger" disabled={settingsBusy || !!overwriteConfirmation || templateCreationMode || templates.length <= 1 || !selectedTemplateId} onClick={deleteSelectedTemplate}>Удалить выбранный шаблон</button>
         {templates.length <= 1 && <p className="rm-hint">Нельзя удалить последний шаблон.</p>}
-        <div className="rm-inline-actions"><button className="rm-primary" disabled={settingsBusy || !templates.length || !defaultTemplateId} onClick={() => void saveTemplate()}>{saving ? 'Сохранение…' : 'Сохранить шаблон'}</button></div>
+        <div className="rm-inline-actions"><button className="rm-primary" disabled={settingsBusy || !templates.length || !defaultTemplateId} onClick={saveTemplate}>{saving ? 'Сохранение…' : 'Сохранить шаблон'}</button></div>
       </article>
     </section>
+    <dialog className="rm-dialog" ref={templateOverwriteDialog} aria-modal="true" aria-labelledby="template-overwrite-title" onCancel={() => { pendingTemplateOverwrite.current = null; setOverwriteConfirmation(null); templateSaveInFlight.current = false; }} onClose={() => setOverwriteConfirmation(null)}>
+      <div className="rm-dialog-card"><div className="rm-dialog-header"><h2 id="template-overwrite-title">Такой шаблон уже существует. Перезаписать его?</h2></div>
+        {overwriteConfirmation && !overwriteConfirmation.isDefault && templates.length === 1 && defaultTemplateId === overwriteConfirmation.targetId && <p className="rm-dialog-hint">Единственный сохранённый шаблон останется шаблоном по умолчанию.</p>}
+        <div className="rm-dialog-actions"><button type="button" className="rm-primary" disabled={saving} onClick={confirmOverwrite}>Перезаписать</button><button type="button" className="rm-secondary" autoFocus onClick={cancelOverwrite}>Отмена</button></div>
+      </div>
+    </dialog>
   </section>;
 }
