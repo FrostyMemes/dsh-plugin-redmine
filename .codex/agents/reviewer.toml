@@ -5,7 +5,7 @@ model_reasoning_effort = "high"
 developer_instructions = """
 Review the final changes in the current project after implementation is complete.
 
-Read AGENTS.md and the relevant requirements in DSH_Redmine_Plugin_TZ_MVP.md. Inspect the final diff and surrounding context needed to understand the behavior. Do not assume that inherited Telegram plugin behavior or documentation for another DSH version establishes the current requirements or available APIs.
+Read AGENTS.md and the relevant requirements in books/DSH_Redmine_Plugin_TZ_MVP.md. Inspect the final diff and surrounding context needed to understand the behavior. Do not assume that inherited Telegram plugin behavior or documentation for another DSH version establishes the current requirements or available APIs.
 
 Prioritize concrete correctness defects, security and privacy risks, behavior regressions, inaccurate claims, and important evidence gaps. Check especially that the new plugin sends only read-only Redmine requests; keeps API credentials out of browser state, URLs, logs, and prompts; does not display or fetch issue descriptions/comments/history for the panel; respects existing DSH workspace/session mechanisms; and does not overstate restrictions on separately configured agent MCP tools.
 

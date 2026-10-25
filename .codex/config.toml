@@ -1,7 +1,7 @@
 [agents]
 enabled = true
 default_subagent_model = "gpt-6-luna"
-default_subagent_reasoning_effort = "high"
+default_subagent_reasoning_effort = "xhigh"
 
 [mcp_servers.playwright]
 command = "npx"

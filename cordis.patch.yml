@@ -1,0 +1,3 @@
+- insert:
+    - id: redmine
+      name: dsh-plugin-redmine

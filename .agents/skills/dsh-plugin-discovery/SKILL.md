@@ -5,7 +5,7 @@ description: Research DSH plugin integration work before implementation when tar
 
 # DSH plugin discovery
 
-Use this workflow for the research stage of changes that integrate a plugin with DSH. Keep the product behavior in `DSH_Redmine_Plugin_TZ_MVP.md`; this skill guides technical discovery and does not prescribe a code structure.
+Use this workflow for the research stage of changes that integrate a plugin with DSH. Keep the product behavior in `books/DSH_Redmine_Plugin_TZ_MVP.md`; this skill guides technical discovery and does not prescribe a code structure.
 
 - Identify the actual DSH version or commit and the relevant host, client, plugin, workspace, and session interfaces.
 - Prefer installed-source evidence for the target build. Use current upstream documentation as a lead, then verify compatibility with the target.
