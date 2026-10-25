@@ -1,9 +1,79 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Filters, Health, Issue, Launch, ListResult, LogEntry, MockScenario, PluginApi, Row, Settings, State, Template, Workspace } from '../shared/contracts.js';
 import { DEFAULT_FILTERS } from '../shared/contracts.js';
 import { sanitizeRuntimeText } from '../diagnostics/runtime.js';
 
 type PanelProps = { api: PluginApi };
+type TemplateHelpPosition = { left: number; top?: number; bottom?: number; width: number; maxHeight: number };
+const TEMPLATE_VARIABLES = [
+  ['{{issue.id}}', 'номер задачи Redmine'],
+  ['{{issue.url}}', 'ссылка на исходную задачу'],
+  ['{{issue.subject}}', 'название задачи'],
+  ['{{project.id}}', 'идентификатор проекта Redmine'],
+  ['{{project.name}}', 'название проекта Redmine'],
+  ['{{status}}', 'название текущего статуса'],
+  ['{{tracker}}', 'тип задачи (трекер)'],
+  ['{{priority}}', 'название приоритета'],
+  ['{{workspace.path}}', 'абсолютный путь выбранного workspace на Host DSH'],
+] as const;
+
+function TemplateVariablesHelp() {
+  const tooltipId = useId();
+  const trigger = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState<TemplateHelpPosition>();
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    const updatePosition = () => {
+      const button = trigger.current;
+      if (!button) return;
+      const rect = button.getBoundingClientRect();
+      const scroller = button.closest<HTMLElement>('.rm-main-root')?.getBoundingClientRect();
+      const viewportTop = Math.max(0, scroller?.top ?? 0);
+      const viewportBottom = Math.min(window.innerHeight, scroller?.bottom ?? window.innerHeight);
+      const viewportLeft = Math.max(0, scroller?.left ?? 0);
+      const viewportRight = Math.min(window.innerWidth, scroller?.right ?? window.innerWidth);
+      if (rect.bottom <= viewportTop || rect.top >= viewportBottom || rect.right <= viewportLeft || rect.left >= viewportRight) { setOpen(false); return; }
+      const spaceAbove = Math.max(0, rect.top - viewportTop);
+      const spaceBelow = Math.max(0, viewportBottom - rect.bottom);
+      const desiredHeight = Math.min(380, window.innerHeight * 0.55);
+      const placeBelow = spaceBelow >= Math.min(desiredHeight, 220) || spaceBelow >= spaceAbove;
+      const availableSpace = placeBelow ? spaceBelow : spaceAbove;
+      const width = Math.min(420, Math.max(0, window.innerWidth - 32));
+      const left = Math.max(16, Math.min(rect.left, window.innerWidth - width - 16));
+      const maxHeight = Math.max(80, Math.min(desiredHeight, availableSpace - 8));
+      setPosition({ left, width, maxHeight, ...(placeBelow ? { top: rect.bottom } : { bottom: window.innerHeight - rect.top }) });
+    };
+    updatePosition();
+    const dismissOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setOpen(false); };
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    window.addEventListener('keydown', dismissOnEscape);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+      window.removeEventListener('keydown', dismissOnEscape);
+    };
+  }, [open]);
+
+  const dismissOnLeave = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!event.currentTarget.contains(document.activeElement)) setOpen(false);
+  };
+  const dismissOnBlur = (event: React.FocusEvent<HTMLDivElement>) => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null) && !event.currentTarget.matches(':hover')) setOpen(false);
+  };
+
+  return <div className="rm-template-help" onMouseEnter={() => setOpen(true)} onMouseLeave={dismissOnLeave} onFocus={() => setOpen(true)} onBlur={dismissOnBlur}>
+    <button ref={trigger} type="button" className="rm-template-help-trigger" aria-label="Показать доступные поля шаблона запуска" aria-describedby={tooltipId} aria-controls={tooltipId} aria-expanded={open}><span aria-hidden="true">i</span></button>
+    <div className="rm-template-help-popup" hidden={!open || !position} style={position ? { left: position.left, top: position.top, bottom: position.bottom, width: position.width } : undefined}>
+      <div id={tooltipId} className="rm-template-help-tooltip" role="tooltip" style={position ? { maxHeight: position.maxHeight } : undefined}>
+        <dl>{TEMPLATE_VARIABLES.map(([name, description]) => <React.Fragment key={name}><dt><code>{name}</code></dt><dd>{description}</dd></React.Fragment>)}</dl>
+      </div>
+    </div>
+  </div>;
+}
+
 const SCENARIOS: { id: MockScenario; label: string }[] = [
   { id: 'normal', label: 'Обычная работа' }, { id: 'slow', label: 'Медленный ответ' },
   { id: 'empty', label: 'Пустой список' }, { id: 'load-error', label: 'Ошибка загрузки' },
@@ -625,9 +695,8 @@ export function RedmineSettings({ api }: PanelProps) {
       {modeSaving && <p className="rm-hint" role="status">Сохранение режима…</p>}
     </section>
     {templateMessage && <div className="rm-notice" role="status">{templateMessage}</div>}{templateError && <div className="rm-error" role="alert" tabIndex={-1}>{templateError}</div>}
-    <section className="rm-settings-section"><h2>Шаблоны запуска</h2>
+    <section className="rm-settings-section"><div className="rm-template-heading"><h2>Шаблоны запуска</h2><TemplateVariablesHelp/></div>
       <p className="rm-hint">Промпт будет отправлен в новую сессию. Текст задачи и комментарии панель не загружает.</p>
-      <p className="rm-hint">Доступные поля: {['{{issue.id}}', '{{issue.url}}', '{{issue.subject}}', '{{project.id}}', '{{project.name}}', '{{status}}', '{{tracker}}', '{{priority}}', '{{workspace.path}}'].map((value, index) => <React.Fragment key={value}>{index > 0 ? ', ' : ''}<code>{value}</code></React.Fragment>)}.</p>
       <article className="rm-template">
         <div className="rm-template-title"><label className="rm-field"><span>Шаблон</span><select value={templateCreationMode ? '' : selectedTemplateId} disabled={settingsBusy || !templates.length} onChange={event => selectTemplate(event.target.value)}><option value="" disabled>{templateCreationMode ? 'Выберите сохранённый шаблон' : 'Выберите шаблон'}</option>{templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label><button className="rm-secondary" disabled={settingsBusy || !!overwriteConfirmation} onClick={createTemplateDraft}>Создать шаблон</button></div>
         <label className="rm-field"><span>Название шаблона</span><input value={templateName} disabled={settingsBusy || !!overwriteConfirmation} onChange={event => { const name = event.target.value; setTemplateName(name); if (!templateCreationMode && soleTemplate && name.trim() === soleTemplate.name.trim()) setTemplateIsDefault(true); clearTemplateFeedback(); }}/></label>

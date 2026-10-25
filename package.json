@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-redmine",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "type": "module",
   "description": "Read-only Redmine dispatcher with native DSH workspaces and sessions",
