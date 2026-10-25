@@ -1,0 +1,3 @@
+interface:
+  display_name: "Redmine read-only review"
+  short_description: "Review Redmine security boundaries"
