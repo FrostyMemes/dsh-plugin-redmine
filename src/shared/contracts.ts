@@ -11,7 +11,7 @@ export interface Filters { projects: number[]; statuses: string[]; trackers: num
 export interface Catalog { projects: Named[]; statuses: (Named & { closed?: boolean })[]; trackers: Named[]; priorities: Named[]; categories: Category[]; warnings: string[] }
 export interface HealthStep { name: string; status: 'ok' | 'warning' | 'error' | 'skipped'; message: string; httpStatus?: number }
 export interface Health { status: 'ok' | 'warning' | 'error'; checkedAt: string; mock: boolean; stale: boolean; user?: Named; steps: HealthStep[] }
-export interface Launch { operationId: string; issueId: number; workspaceId: string; sessionId: string; requestId: string; status: 'creating' | 'sending' | 'sent' | 'failed'; createdAt: string; error?: string }
+export interface Launch { operationId: string; issueId: number; workspaceId: string; sessionId: string; requestId: string; sessionTitle?: string; titleApplied?: boolean; status: 'creating' | 'sending' | 'sent' | 'failed'; createdAt: string; error?: string }
 export interface Row { issue: Issue; workspace?: Workspace; launches: Launch[] }
 export interface ListResult { rows: Row[]; total: number; catalog: Catalog; filters: Filters; fetchedAt: string; incomplete: boolean; user: Named }
 export interface LogEntry { id: string; time: string; level: Level; component: string; operation: string; message: string; fields: Record<string, string | number | boolean | null> }
@@ -42,6 +42,7 @@ export interface DshAdapter {
   validate(id: string): Promise<Workspace>;
   createSession(workspaceId: string, sessionId: string): Promise<string>;
   sendPrompt(sessionId: string, requestId: string, text: string): Promise<void>;
+  renameSession(sessionId: string, title: string): Promise<void>;
   sessionExists(sessionId: string): Promise<boolean>;
 }
 export const DEFAULT_FILTERS: Filters = { projects: [], statuses: ['open'], trackers: [], priorities: [], categories: [], search: '', sort: 'updated-desc', page: 1, pageSize: 25 };

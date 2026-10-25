@@ -305,18 +305,25 @@ export class PluginService {
     const storageKey = `redmine.scope.${scope}.launch.${input.operationId}`;
     let launch = await this.o.store.get<Launch | undefined>(storageKey, undefined); this.assertGeneration(generation);
     if (launch?.status === 'sent') return launch;
-    if (!launch) { launch = { operationId: input.operationId, issueId: issue.id, workspaceId: workspace.id, sessionId: `redmine-${input.operationId}`, requestId: input.operationId, status: 'creating', createdAt: now() }; await this.o.store.set(storageKey, launch); this.assertGeneration(generation); await this.recordLaunch(launch, scope); this.assertGeneration(generation); }
+    if (!launch) { launch = { operationId: input.operationId, issueId: issue.id, workspaceId: workspace.id, sessionId: `redmine-${input.operationId}`, requestId: input.operationId, sessionTitle: issue.subject, status: 'creating', createdAt: now() }; await this.o.store.set(storageKey, launch); this.assertGeneration(generation); await this.recordLaunch(launch, scope); this.assertGeneration(generation); }
     else if (launch.issueId !== issue.id || launch.workspaceId !== workspace.id) throw new Error('Operation ID is already bound to a different launch');
+    else launch = { ...launch, sessionTitle: launch.sessionTitle ?? issue.subject };
     try {
       if (launch.status === 'failed') {
         const exists = await this.o.dsh.sessionExists(launch.sessionId); this.assertGeneration(generation);
-        launch = { ...launch, status: exists ? 'sending' : 'creating', error: undefined };
+        launch = { ...launch, status: exists ? 'sending' : 'creating', titleApplied: exists ? launch.titleApplied : false, error: undefined };
       }
       if (launch.status === 'creating') {
         const createdId = await this.o.dsh.createSession(launch.workspaceId, launch.sessionId);
         if (createdId) launch = { ...launch, sessionId: createdId };
         this.assertGeneration(generation);
         launch = { ...launch, status: 'sending' }; await this.o.store.set(storageKey, launch); this.assertGeneration(generation); await this.recordLaunch(launch, scope); this.assertGeneration(generation);
+      }
+      if (!launch.titleApplied) {
+        await this.o.dsh.renameSession(launch.sessionId, launch.sessionTitle ?? issue.subject);
+        this.assertGeneration(generation);
+        launch = { ...launch, sessionTitle: launch.sessionTitle ?? issue.subject, titleApplied: true };
+        await this.o.store.set(storageKey, launch); this.assertGeneration(generation); await this.recordLaunch(launch, scope); this.assertGeneration(generation);
       }
       const quote = (v: string) => JSON.stringify(v);
       const promptBody = template.text.replace(/{{\s*([^}]+?)\s*}}/g, (_m, k: string) => {

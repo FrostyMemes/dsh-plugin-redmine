@@ -8,11 +8,10 @@ import css from './style.css';
 import { installRuntimeDiagnostics, type RuntimeDiagnostic } from '../diagnostics/runtime.js';
 import { DiagnosticsErrorBoundary } from '../diagnostics/DiagnosticsErrorBoundary.js';
 
-export const inject = ['remote', 'slots', 'layout', 'uiWorkspace'];
+export const inject = ['remote', 'slots', 'uiWorkspace'];
 interface ClientContext {
   remote: { $mount(contribution: unknown): Promise<() => Promise<void>>; redmine: { invoke(request: unknown): Promise<any> } };
   slots: { inject(name: string, callback: () => unknown): unknown; register(options: Record<string, unknown>, component: React.ComponentType<any>): unknown };
-  layout: { selectPanel(panelId: string | null): void };
   uiWorkspace: { pickDirectory(): Promise<string | null>; openSession(id: string): Promise<void> | void };
 }
 export function createClientApi(ctx: ClientContext): PluginApi {
@@ -24,7 +23,7 @@ export function createClientApi(ctx: ClientContext): PluginApi {
       return result.value.value;
     },
     async pickDirectory() { return (await ctx.uiWorkspace.pickDirectory()) ?? undefined; },
-    async openSession(id) { await ctx.uiWorkspace.openSession(id); ctx.layout.selectPanel(null); },
+    async openSession(id) { await ctx.uiWorkspace.openSession(id); },
   };
 }
 export function RedmineRoot({ api }: { api: PluginApi }) {
@@ -35,7 +34,7 @@ export function RedmineRoot({ api }: { api: PluginApi }) {
     window.addEventListener('redmine:open-settings', open);
     return () => window.removeEventListener('redmine:open-settings', open);
   }, []);
-  return settings ? <div><div className="redmine-app rm-back"><button onClick={() => { showSettings(false); bump(x => x + 1); }}>← Мои задачи</button></div><RedmineSettings api={api}/></div> : <RedminePanel key={version} api={api}/>;
+  return <div className="rm-main-root">{settings ? <><div className="rm-back"><button className="rm-back-button" onClick={() => { showSettings(false); bump(x => x + 1); }}>← Мои задачи</button></div><RedmineSettings api={api}/></> : <RedminePanel key={version} api={api}/>}</div>;
 }
 export function apply(ctx: Context) {
   const client = ctx as unknown as ClientContext;

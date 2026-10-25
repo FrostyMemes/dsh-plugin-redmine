@@ -19,6 +19,25 @@ const shortPath = (path: string) => path || 'Путь не указан';
 const statusTone = (closed?: boolean) => closed === true ? 'closed' : closed === false ? 'open' : 'unknown';
 const safeIssueUrl = (value: string) => { try { const url = new URL(value); return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : undefined; } catch { return undefined; } };
 const HEALTH_LABELS = { ok: 'Успешно', warning: 'Предупреждение', error: 'Ошибка', skipped: 'Пропущено' } as const;
+const expandLegacyStatuses = (value: string[], statuses: { id: number; closed?: boolean }[]) => {
+  if (!statuses.length) return value;
+  if (value.includes('*') || value.includes('all')) return [];
+  const legacyGroups = value.filter(token => token === 'open' || token === 'closed');
+  if (!legacyGroups.length || statuses.some(status => status.closed === undefined)) return value;
+  const ids = value.filter(token => token !== 'open' && token !== 'closed');
+  for (const group of legacyGroups) {
+    const closed = group === 'closed';
+    const matching = statuses.filter(status => status.closed === closed);
+    ids.push(...(matching.length ? matching.map(status => String(status.id)) : [group]));
+  }
+  return [...new Set(ids)];
+};
+const newTemplateId = (templates: Template[]) => {
+  let id = '';
+  do { id = `template-${Date.now()}-${Math.random().toString(36).slice(2)}`; }
+  while (templates.some(template => template.id === id));
+  return id;
+};
 const sanitizeLog = (log: LogEntry): LogEntry => ({
   ...log,
   component: sanitizeRuntimeText(log.component, 96),
@@ -117,7 +136,8 @@ export function RedminePanel({ api }: PanelProps) {
     void api.call('list', { filters: JSON.parse(filterKey) as Filters, refresh: forceRefresh }).then(data => {
       if (!alive || request !== seq.current) return;
       setResult(data);
-      if (JSON.stringify(data.filters) !== filterKey) setFilters(data.filters);
+      const acceptedFilters = { ...data.filters, statuses: expandLegacyStatuses(data.filters.statuses, data.catalog.statuses) };
+      if (JSON.stringify(acceptedFilters) !== filterKey) setFilters(current => JSON.stringify(current) === filterKey ? acceptedFilters : current);
       setRemote(prev => prev ? { ...prev, filters: data.filters } : prev);
       firstLoad.current = false;
       if (data.incomplete) setNotice('Показаны доступные данные. Часть справочников или результатов недоступна.');
@@ -345,31 +365,37 @@ function DiagnosticsLogDialog({ api, open, enabled, onState, onClose }: { api: P
   </dialog>;
 }
 
-function MultiSelect({ label, options, selected, onChange, searchable = false, allLabel, hidden = false }: { label: string; options: { id: number; name: string }[]; selected: number[]; onChange: (value: number[]) => void; searchable?: boolean; allLabel?: string; hidden?: boolean }) {
+function MultiSelect<T extends number | string>({ label, options, selected, onChange, searchable = false, allLabel, hidden = false, allSelected, selectionLabel, emptyHint }: { label: string; options: { id: T; name: string }[]; selected: T[]; onChange: (value: T[]) => void; searchable?: boolean; allLabel?: string; hidden?: boolean; allSelected?: boolean; selectionLabel?: string; emptyHint?: string }) {
   const [open, setOpen] = useState(false); const [query, setQuery] = useState(''); const ref = useRef<HTMLDivElement>(null);
   useEffect(() => { if (!open) return; const outside = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) setOpen(false); }; document.addEventListener('mousedown', outside); return () => document.removeEventListener('mousedown', outside); }, [open]);
   if (hidden) return null;
   const shown = options.filter(o => !query || o.name.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
-  const labelText = !selected.length ? (allLabel ?? 'Все') : selected.length === 1 ? options.find(x => x.id === selected[0])?.name ?? '1 выбрано' : `${selected.length} выбрано`;
-  return <div className="rm-multi" ref={ref}><span className="rm-filter-caption">{label}</span><button type="button" aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen(!open)}>{labelText}<span aria-hidden="true">⌄</span></button>{open && <div className="rm-multi-menu" role="group" aria-label={label}>{searchable && <input autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder="Найти проект" aria-label={`Поиск: ${label}`}/>}<label className="rm-option"><input type="checkbox" checked={!selected.length} onChange={() => onChange([])}/><span>{allLabel ?? 'Все'}</span></label>{shown.map(o => <label className="rm-option" key={o.id}><input type="checkbox" checked={selected.includes(o.id)} onChange={e => onChange(e.target.checked ? [...selected, o.id] : selected.filter(id => id !== o.id))}/><span>{o.name}</span></label>)}{!shown.length && <p className="rm-multi-empty">Ничего не найдено</p>}</div>}</div>;
+  const labelText = selectionLabel ?? (!selected.length ? (allLabel ?? 'Все') : selected.length === 1 ? options.find(x => x.id === selected[0])?.name ?? String(selected[0]) : `${selected.length} выбрано`);
+  return <div className="rm-multi" ref={ref}><span className="rm-filter-caption">{label}</span><button type="button" aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen(!open)}>{labelText}<span aria-hidden="true">⌄</span></button>{open && <div className="rm-multi-menu" role="group" aria-label={label}>{searchable && <input autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder="Найти проект" aria-label={`Поиск: ${label}`}/>}<label className="rm-option"><input type="checkbox" checked={allSelected ?? !selected.length} onChange={() => onChange([])}/><span>{allLabel ?? 'Все'}</span></label>{shown.map(o => <label className="rm-option" key={o.id}><input type="checkbox" checked={selected.includes(o.id)} onChange={e => onChange(e.target.checked ? [...selected, o.id] : selected.filter(id => id !== o.id))}/><span>{o.name}</span></label>)}{emptyHint ? <p className="rm-multi-empty">{emptyHint}</p> : !shown.length && <p className="rm-multi-empty">Ничего не найдено</p>}</div>}</div>;
 }
 function StatusSelect({ statuses, value, onChange }: { statuses: { id: number; name: string; closed?: boolean }[]; value: string[]; onChange: (value: string[]) => void }) {
-  const [open, setOpen] = useState(false); const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => { if (!open) return; const outside = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) setOpen(false); }; document.addEventListener('mousedown', outside); return () => document.removeEventListener('mousedown', outside); }, [open]);
-  const label = value.includes('*') ? 'Все статусы' : value.includes('closed') ? 'Все закрытые' : value.length === 0 || value.includes('open') ? 'Все открытые' : value.length === 1 ? statuses.find(s => String(s.id) === value[0])?.name ?? 'Статусы' : `${value.length} выбрано`;
-  const setGroup = (group: 'open' | 'closed' | '*') => onChange(group === '*' ? ['*'] : [group]);
-  const toggle = (id: string) => {
-    const current = value.filter(v => v !== '*' && v !== 'open' && v !== 'closed');
-    onChange(current.includes(id) ? current.filter(v => v !== id) : [...current, id]);
-  };
-  const selectedId = (status: { id: number; closed?: boolean }) => value.includes('*') || value.includes(String(status.id)) || value.includes(status.closed ? 'closed' : 'open');
-  return <div className="rm-multi rm-status-select" ref={ref}><span className="rm-filter-caption">Статусы</span><button type="button" aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen(!open)}>{label}<span aria-hidden="true">⌄</span></button>{open && <div className="rm-multi-menu" role="group" aria-label="Статусы">
-    <label className="rm-option"><input type="checkbox" checked={value.includes('*')} onChange={() => setGroup('*')}/><span>Все статусы</span></label>
-    <label className="rm-option"><input type="checkbox" checked={value.includes('open')} onChange={() => setGroup('open')}/><span>Все открытые</span></label>
-    <label className="rm-option"><input type="checkbox" checked={value.includes('closed')} onChange={() => setGroup('closed')}/><span>Все закрытые</span></label>
-    <div className="rm-status-divider">Или выбрать статусы</div>
-    {statuses.map(status => <label className="rm-option" key={status.id}><input type="checkbox" checked={selectedId(status)} onChange={() => toggle(String(status.id))}/><span>{status.name}</span></label>)}
-  </div>}</div>;
+  const allSelected = value.length === 0 || value.includes('*') || value.includes('all');
+  const expanded = expandLegacyStatuses(value, statuses);
+  const selected = expanded.filter(id => statuses.some(status => String(status.id) === id));
+  const legacyGroups = expanded.filter(token => token === 'open' || token === 'closed');
+  const unresolvedLegacy = legacyGroups.length > 0;
+  const legacyNames = legacyGroups.map(token => token === 'open' ? 'Все открытые' : 'Все закрытые');
+  const unknownIds = expanded.filter(token => token !== 'open' && token !== 'closed' && token !== '*' && token !== 'all' && !statuses.some(status => String(status.id) === token));
+  const closureFlagsKnown = statuses.length > 0 && statuses.every(status => status.closed !== undefined);
+  const emptyLegacyGroup = unresolvedLegacy && closureFlagsKnown;
+  const selectionLabel = allSelected ? 'Все статусы' : unresolvedLegacy
+    ? `${[...new Set(legacyNames)].join(' и ')}${emptyLegacyGroup ? ' (0 в справочнике)' : ' · фильтр сохранён'}`
+    : selected.length === 1 ? statuses.find(status => String(status.id) === selected[0])?.name ?? `#${selected[0]}`
+      : selected.length > 1 ? `${selected.length} выбрано`
+        : unknownIds.length ? `${unknownIds.map(id => `#${id}`).join(', ')} · список недоступен`
+          : value.length ? `${value.length} выбрано` : 'Все статусы';
+  const emptyHint = unresolvedLegacy
+    ? emptyLegacyGroup
+      ? `Для сохранённого фильтра ${[...new Set(legacyNames)].join(' и ').toLocaleLowerCase('ru-RU')} нет соответствующих статусов в справочнике.`
+      : `${[...new Set(legacyNames)].join(' и ')} — сохранённый фильтр; состав конкретных статусов пока нельзя определить.`
+    : unknownIds.length ? `Сохранённые ID статусов (${unknownIds.map(id => `#${id}`).join(', ')}) отсутствуют в доступном справочнике.`
+    : statuses.length ? undefined : 'Справочник статусов недоступен.';
+  return <MultiSelect label="Статусы" options={statuses.map(status => ({ id: String(status.id), name: status.name }))} selected={selected} onChange={onChange} allLabel="Все статусы" allSelected={allSelected} selectionLabel={selectionLabel} emptyHint={emptyHint}/>;
 }
 function HealthResults({ health }: { health: Health }) {
   return <div className="rm-health-results">
@@ -385,8 +411,12 @@ export function RedmineSettings({ api }: PanelProps) {
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
   const [modeSaving, setModeSaving] = useState<'mockEnabled' | 'developerMode' | null>(null);
-  const [error, setError] = useState('');
-  const [message, setMessage] = useState('');
+  const [connectionError, setConnectionError] = useState('');
+  const [connectionMessage, setConnectionMessage] = useState('');
+  const [modeError, setModeError] = useState('');
+  const [modeMessage, setModeMessage] = useState('');
+  const [templateError, setTemplateError] = useState('');
+  const [templateMessage, setTemplateMessage] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [clearKey, setClearKey] = useState(false);
@@ -394,7 +424,13 @@ export function RedmineSettings({ api }: PanelProps) {
   const [developerMode, setDeveloperMode] = useState(false);
   const [templates, setTemplates] = useState<Template[]>([]);
   const [defaultTemplateId, setDefaultTemplateId] = useState('');
+  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [templateName, setTemplateName] = useState('');
+  const [templateText, setTemplateText] = useState('');
+  const [templateIsDefault, setTemplateIsDefault] = useState(true);
   const [health, setHealth] = useState<Health>();
+  const soleTemplate = templates.length === 1 ? templates[0] : undefined;
+  const onlyExistingDefaultTarget = !!soleTemplate && templateName.trim() === soleTemplate.name.trim();
 
   useEffect(() => {
     let alive = true;
@@ -403,53 +439,114 @@ export function RedmineSettings({ api }: PanelProps) {
       setState(saved); setBaseUrl(saved.settings.baseUrl); setMockEnabled(saved.settings.mockEnabled);
       setDeveloperMode(saved.settings.developerMode);
       setTemplates(saved.settings.templates); setDefaultTemplateId(saved.settings.defaultTemplateId); setHealth(saved.health);
-    }).catch(e => alive && setError(errText(e))).finally(() => alive && setLoading(false));
+      const selected = saved.settings.templates.find(template => template.id === saved.settings.defaultTemplateId) ?? saved.settings.templates[0];
+      setSelectedTemplateId(selected?.id ?? ''); setTemplateName(selected?.name ?? ''); setTemplateText(selected?.text ?? '');
+      setTemplateIsDefault(!!selected && selected.id === saved.settings.defaultTemplateId);
+    }).catch(e => alive && setConnectionError(errText(e))).finally(() => alive && setLoading(false));
     return () => { alive = false; };
   }, [api]);
 
   const save = async (patch: Partial<Omit<Settings, 'keyConfigured'>> & { apiKey?: string; clearKey?: boolean }) => {
-    if (checking || modeSaving) return;
-    setSaving(true); setError(''); setMessage('');
+    if (checking || modeSaving || saving) return;
+    setSaving(true); setConnectionError(''); setConnectionMessage('');
     try {
       const saved = await api.call('configure', patch);
       setState(saved); setHealth(saved.health);
       if (patch.baseUrl !== undefined) setBaseUrl(saved.settings.baseUrl);
-      if (patch.templates !== undefined) setTemplates(saved.settings.templates);
-      if (patch.templates !== undefined || patch.defaultTemplateId !== undefined) setDefaultTemplateId(saved.settings.defaultTemplateId);
       if (patch.apiKey !== undefined || patch.clearKey === true) { setApiKey(''); setClearKey(false); }
-      setMessage('Настройки сохранены.');
-    } catch (e) { setError(errText(e)); }
+      setConnectionMessage('Настройки подключения сохранены');
+    } catch (e) { setConnectionError(errText(e)); }
     finally { setSaving(false); }
   };
 
   const saveMode = async (field: 'mockEnabled' | 'developerMode', value: boolean) => {
     if (!state || saving || checking || modeSaving) return;
-    setModeSaving(field); setError(''); setMessage('');
+    setModeSaving(field); setModeError(''); setModeMessage('');
     try {
       const saved = field === 'mockEnabled'
         ? await api.call('configure', { mockEnabled: value })
         : await api.call('configure', { developerMode: value });
       setState(saved); setHealth(saved.health);
       setMockEnabled(saved.settings.mockEnabled); setDeveloperMode(saved.settings.developerMode);
-      setMessage('Режим сохранён.');
+      setModeMessage('Режим сохранён');
     } catch (e) {
       setMockEnabled(state.settings.mockEnabled); setDeveloperMode(state.settings.developerMode);
-      setError(errText(e));
+      setModeError(errText(e));
     } finally { setModeSaving(null); }
   };
 
   const markHealthStale = () => setHealth(current => current ? { ...current, stale: true } : current);
   const check = async () => {
     if (!state || saving || modeSaving || checking) return;
-    setChecking(true); setError(''); setMessage('');
+    setChecking(true); setConnectionError(''); setConnectionMessage('');
     try {
       const checked = await api.call('check', {});
       setHealth(checked); setState(current => current ? { ...current, health: checked } : current);
-      if (checked.mock) setMessage(`Демо-проверка завершена: ${HEALTH_LABELS[checked.status].toLocaleLowerCase('ru-RU')}.`);
-      else if (checked.status === 'ok' && checked.user) setMessage(`Подключено: ${checked.user.name}`);
-      else setMessage(`Проверка завершена: ${HEALTH_LABELS[checked.status].toLocaleLowerCase('ru-RU')}.`);
-    } catch (e) { setError(errText(e)); }
+    } catch (e) { setConnectionError(errText(e)); }
     finally { setChecking(false); }
+  };
+
+  const clearTemplateFeedback = () => { setTemplateError(''); setTemplateMessage(''); };
+  const selectTemplate = (id: string) => {
+    const selected = templates.find(template => template.id === id);
+    if (!selected) return;
+    setSelectedTemplateId(selected.id); setTemplateName(selected.name); setTemplateText(selected.text);
+    setTemplateIsDefault(defaultTemplateId === selected.id); clearTemplateFeedback();
+  };
+  const setTemplateDefault = (checked: boolean) => {
+    clearTemplateFeedback();
+    if (checked) {
+      setTemplateIsDefault(true);
+      return;
+    }
+    if (onlyExistingDefaultTarget) return;
+    setTemplateIsDefault(false);
+  };
+  const deleteSelectedTemplate = async () => {
+    if (settingsBusy || templates.length <= 1 || !selectedTemplateId) return;
+    clearTemplateFeedback();
+    const rest = templates.filter(template => template.id !== selectedTemplateId);
+    const nextDefaultId = defaultTemplateId === selectedTemplateId || !rest.some(template => template.id === defaultTemplateId) ? rest[0].id : defaultTemplateId;
+    setSaving(true);
+    try {
+      const saved = await api.call('configure', { templates: rest, defaultTemplateId: nextDefaultId });
+      setState(saved); setHealth(saved.health); setTemplates(saved.settings.templates); setDefaultTemplateId(saved.settings.defaultTemplateId);
+      const nextSelected = saved.settings.templates.find(template => template.id === saved.settings.defaultTemplateId) ?? saved.settings.templates[0];
+      setSelectedTemplateId(nextSelected?.id ?? ''); setTemplateName(nextSelected?.name ?? ''); setTemplateText(nextSelected?.text ?? '');
+      setTemplateIsDefault(!!nextSelected && nextSelected.id === saved.settings.defaultTemplateId);
+      setTemplateMessage('Шаблон удалён');
+    } catch (e) { setTemplateError(errText(e)); }
+    finally { setSaving(false); }
+  };
+  const saveTemplate = async () => {
+    const name = templateName.trim();
+    if (!name) { setTemplateError('Введите название шаблона.'); setTemplateMessage(''); return; }
+    if (!templateText.trim()) { setTemplateError('Введите текст промпта шаблона.'); setTemplateMessage(''); return; }
+    if (settingsBusy) return;
+    const selectedMatchesName = templates.find(template => template.id === selectedTemplateId && template.name.trim() === name);
+    const target = selectedMatchesName ?? templates.find(template => template.name.trim() === name);
+    const targetId = target?.id ?? newTemplateId(templates);
+    const savedTemplate = { id: targetId, name, text: templateText };
+    const nextTemplates = target
+      ? templates.map(template => template.id === targetId ? savedTemplate : template)
+      : [...templates, savedTemplate];
+    const fallbackDefault = nextTemplates.find(template => template.id !== targetId)?.id ?? targetId;
+    const nextDefaultId = templateIsDefault
+      ? targetId
+      : defaultTemplateId === targetId
+        ? fallbackDefault
+        : defaultTemplateId;
+
+    setSaving(true); setTemplateError(''); setTemplateMessage('');
+    try {
+      const saved = await api.call('configure', { templates: nextTemplates, defaultTemplateId: nextDefaultId });
+      setState(saved); setHealth(saved.health); setTemplates(saved.settings.templates); setDefaultTemplateId(saved.settings.defaultTemplateId);
+      const selected = saved.settings.templates.find(template => template.id === targetId) ?? saved.settings.templates.find(template => template.id === saved.settings.defaultTemplateId) ?? saved.settings.templates[0];
+      setSelectedTemplateId(selected?.id ?? ''); setTemplateName(selected?.name ?? ''); setTemplateText(selected?.text ?? '');
+      setTemplateIsDefault(!!selected && selected.id === saved.settings.defaultTemplateId);
+      setTemplateMessage('Шаблон сохранён');
+    } catch (e) { setTemplateError(errText(e)); }
+    finally { setSaving(false); }
   };
 
   const normalizedUrl = (value: string) => {
@@ -462,30 +559,37 @@ export function RedmineSettings({ api }: PanelProps) {
   if (loading) return <section className="redmine-app rm-settings"><div className="rm-skeleton"><i/><i/></div></section>;
   return <section className="redmine-app rm-settings" aria-labelledby="settings-title">
     <header className="rm-settings-head"><div><h1 id="settings-title">Настройки Redmine</h1><p>Подключение, режимы и шаблоны запуска.</p></div></header>
-    {error && <div className="rm-error" role="alert" tabIndex={-1}>{error}</div>}{message && <div className="rm-notice" role="status">{message}</div>}
+    {connectionMessage && <div className="rm-notice" role="status">{connectionMessage}</div>}{connectionError && <div className="rm-error" role="alert" tabIndex={-1}>{connectionError}</div>}
     <section className="rm-settings-section"><h2>Подключение</h2>
-      <label className="rm-field"><span>URL Redmine</span><input type="url" value={baseUrl} onChange={event => { setBaseUrl(event.target.value); markHealthStale(); }} placeholder="https://redmine.example.org" autoComplete="url"/></label>
-      <label className="rm-field"><span>Персональный API-ключ {state?.settings.keyConfigured && <small>Ключ сохранён</small>}</span><input type="password" value={apiKey} onChange={event => { setApiKey(event.target.value); setClearKey(false); markHealthStale(); }} placeholder={state?.settings.keyConfigured ? 'Оставьте пустым, чтобы сохранить текущий' : 'Введите API-ключ'} autoComplete="new-password"/></label>
-      {state?.settings.keyConfigured && <label className="rm-checkbox"><input type="checkbox" checked={clearKey} onChange={event => { setClearKey(event.target.checked); setApiKey(''); markHealthStale(); }}/><span>Удалить сохранённый ключ</span></label>}
+      <label className="rm-field"><span>URL Redmine</span><input type="url" value={baseUrl} onChange={event => { setBaseUrl(event.target.value); setConnectionError(''); setConnectionMessage(''); markHealthStale(); }} placeholder="https://redmine.example.org" autoComplete="url"/></label>
+      <label className="rm-field"><span>Персональный API-ключ {state?.settings.keyConfigured && <small>Ключ сохранён</small>}</span><input type="password" value={apiKey} onChange={event => { setApiKey(event.target.value); setClearKey(false); setConnectionError(''); setConnectionMessage(''); markHealthStale(); }} placeholder={state?.settings.keyConfigured ? 'Оставьте пустым, чтобы сохранить текущий' : 'Введите API-ключ'} autoComplete="new-password"/></label>
+      {state?.settings.keyConfigured && <label className="rm-checkbox"><input type="checkbox" checked={clearKey} onChange={event => { setClearKey(event.target.checked); setApiKey(''); setConnectionError(''); setConnectionMessage(''); markHealthStale(); }}/><span>Удалить сохранённый ключ</span></label>}
       <div className="rm-inline-actions"><button className="rm-secondary" disabled={settingsBusy || connectionDraftChanged} onClick={() => void check()}>{checking ? 'Проверка…' : 'Проверить подключение'}</button><button className="rm-primary" disabled={settingsBusy} onClick={() => void save({ baseUrl, ...(apiKey ? { apiKey } : {}), ...(clearKey ? { clearKey: true } : {}) })}>{saving ? 'Сохранение…' : 'Сохранить подключение'}</button></div>
       {connectionDraftChanged && <p className="rm-hint" role="status">Сохраните подключение перед проверкой.</p>}
       {health ? <HealthResults health={health}/> : <p className="rm-hint">Проверка ещё не запускалась.</p>}
     </section>
+    {modeMessage && <div className="rm-notice" role="status">{modeMessage}</div>}{modeError && <div className="rm-error" role="alert" tabIndex={-1}>{modeError}</div>}
     <section className="rm-settings-section"><h2>Режимы разработки</h2>
       <p className="rm-hint">Журнал диагностики доступен при включённом режиме разработчика для демо- и реального подключения.</p>
-      <label className="rm-checkbox"><input type="checkbox" checked={mockEnabled} disabled={settingsBusy} onChange={event => { setMockEnabled(event.target.checked); void saveMode('mockEnabled', event.target.checked); }}/><span>Использовать демонстрационные данные</span></label>
-      <label className="rm-checkbox"><input type="checkbox" checked={developerMode} disabled={settingsBusy} onChange={event => { setDeveloperMode(event.target.checked); void saveMode('developerMode', event.target.checked); }}/><span>Режим разработчика и журнал диагностики</span></label>
+      <label className="rm-checkbox"><input type="checkbox" checked={mockEnabled} disabled={settingsBusy} onChange={event => { setModeError(''); setModeMessage(''); setMockEnabled(event.target.checked); void saveMode('mockEnabled', event.target.checked); }}/><span>Использовать демонстрационные данные</span></label>
+      <label className="rm-checkbox"><input type="checkbox" checked={developerMode} disabled={settingsBusy} onChange={event => { setModeError(''); setModeMessage(''); setDeveloperMode(event.target.checked); void saveMode('developerMode', event.target.checked); }}/><span>Режим разработчика и журнал диагностики</span></label>
       {modeSaving && <p className="rm-hint" role="status">Сохранение режима…</p>}
     </section>
+    {templateMessage && <div className="rm-notice" role="status">{templateMessage}</div>}{templateError && <div className="rm-error" role="alert" tabIndex={-1}>{templateError}</div>}
     <section className="rm-settings-section"><h2>Шаблоны запуска</h2>
       <p className="rm-hint">Промпт будет отправлен в новую сессию. Текст задачи и комментарии панель не загружает.</p>
       <p className="rm-hint">Доступные поля: {['{{issue.id}}', '{{issue.url}}', '{{issue.subject}}', '{{project.id}}', '{{project.name}}', '{{status}}', '{{tracker}}', '{{priority}}', '{{workspace.path}}'].map((value, index) => <React.Fragment key={value}>{index > 0 ? ', ' : ''}<code>{value}</code></React.Fragment>)}.</p>
-      {templates.map((template, index) => <article className="rm-template" key={template.id}>
-        <div className="rm-template-title"><label className="rm-field"><span>Название шаблона</span><input value={template.name} onChange={event => setTemplates(current => current.map((item, i) => i === index ? { ...item, name: event.target.value } : item))}/></label><label className="rm-checkbox"><input type="radio" name="default-template" checked={defaultTemplateId === template.id} onChange={() => setDefaultTemplateId(template.id)}/><span>Шаблон по умолчанию</span></label></div>
-        <label className="rm-field"><span>Текст шаблона</span><textarea rows={5} value={template.text} onChange={event => setTemplates(current => current.map((item, i) => i === index ? { ...item, text: event.target.value } : item))}/></label>
-        <button className="rm-link-button danger" onClick={() => { const rest = templates.filter(item => item.id !== template.id); setTemplates(rest); if (defaultTemplateId === template.id) setDefaultTemplateId(rest[0]?.id ?? ''); }}>Удалить шаблон</button>
-      </article>)}
-      <div className="rm-inline-actions"><button className="rm-secondary" disabled={settingsBusy} onClick={() => { const template = { id: `template-${Date.now()}`, name: 'Новый шаблон', text: 'Изучи задачу Redmine №{{issue.id}}: {{issue.url}}\n\nРаботай в выбранном workspace DSH.' }; setTemplates(current => [...current, template]); setDefaultTemplateId(template.id); }}>Добавить шаблон</button><button className="rm-primary" disabled={settingsBusy || !templates.length || !defaultTemplateId} onClick={() => void save({ templates, defaultTemplateId })}>Сохранить шаблоны</button></div>
+      <article className="rm-template">
+        <div className="rm-template-title"><label className="rm-field"><span>Шаблон</span><select value={selectedTemplateId} disabled={settingsBusy || !templates.length} onChange={event => selectTemplate(event.target.value)}>{templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label></div>
+        <label className="rm-field"><span>Название шаблона</span><input value={templateName} disabled={settingsBusy} onChange={event => { const name = event.target.value; setTemplateName(name); if (soleTemplate && name.trim() === soleTemplate.name.trim()) setTemplateIsDefault(true); clearTemplateFeedback(); }}/></label>
+        <label className="rm-checkbox"><input type="checkbox" checked={templateIsDefault} disabled={settingsBusy || onlyExistingDefaultTarget} onChange={event => setTemplateDefault(event.target.checked)}/><span>Шаблон по умолчанию</span></label>
+        {onlyExistingDefaultTarget && <p className="rm-hint">Единственный сохранённый шаблон должен оставаться шаблоном по умолчанию.</p>}
+        {soleTemplate && !onlyExistingDefaultTarget && !templateIsDefault && <p className="rm-hint">Новый шаблон будет сохранён без значения по умолчанию; текущий шаблон останется основным.</p>}
+        <label className="rm-field"><span>Текст промпта шаблона</span><textarea rows={5} value={templateText} disabled={settingsBusy} onChange={event => { setTemplateText(event.target.value); clearTemplateFeedback(); }}/></label>
+        <button className="rm-link-button danger" disabled={settingsBusy || templates.length <= 1} onClick={deleteSelectedTemplate}>Удалить выбранный шаблон</button>
+        {templates.length <= 1 && <p className="rm-hint">Нельзя удалить последний шаблон.</p>}
+        <div className="rm-inline-actions"><button className="rm-primary" disabled={settingsBusy || !templates.length || !defaultTemplateId} onClick={() => void saveTemplate()}>{saving ? 'Сохранение…' : 'Сохранить шаблон'}</button></div>
+      </article>
     </section>
   </section>;
 }

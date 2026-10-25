@@ -2,59 +2,19 @@ import { Service, type Context } from '@deepseek-ai/cordis';
 import { Remote, RemoteError, TypertRemoteService, principalOf } from '@deepseek-ai/dsh-typert-protocol';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain';
-import { access, realpath, stat } from 'node:fs/promises';
-import { constants } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { z } from 'zod';
 import { PluginService } from '../core/service.js';
 import { envelopeSchema, inputSchemas } from '../shared/rpc.js';
-import type { Action, CredentialStore, DshAdapter, Store, Workspace } from '../shared/contracts.js';
+import type { Action, CredentialStore, Store } from '../shared/contracts.js';
 import { createBuildDiagnosticsImporter } from '../diagnostics/build-importer.js';
 import { sanitizeRuntimeText } from '../diagnostics/runtime.js';
+import { createDshAdapter } from './dsh-adapter.js';
+import type { HostServices } from './dsh-adapter.js';
 
 const CREDENTIAL = credentialRef('DSH_REDMINE_API_KEY');
 const DOMAIN = defineDomain({ name: 'redmine_plugin', version: 1, tables: { records: domainTable(z.object({ value: z.json() })) } });
-interface Entity { id: string; title: string; path: string }
-interface HostServices {
-  workspaceRegistry: { list(): Entity[]; get(id: string): Entity | undefined; create(path: string): Promise<Entity>; archivedSessionIds: readonly string[] };
-  sessionController: { create(x: { workspaceId: string; sessionId: string }): Promise<{ sessionId: string }>; prompt(x: { sessionId: string; requestId: string; mode: 'followup'; content: { type: 'text'; text: string }[] }, signal: AbortSignal): Promise<unknown>; list(x: {}, signal: AbortSignal): Promise<{ items: { id: string }[] }> };
-}
-export function createDshAdapter(services: HostServices): DshAdapter {
-  async function view(entity: Entity): Promise<Workspace> {
-    let available = false;
-    try { available = (await stat(entity.path)).isDirectory(); if (available) await access(entity.path, constants.R_OK | constants.X_OK); } catch { available = false; }
-    return { id: entity.id, name: entity.title, path: entity.path, available };
-  }
-  return {
-    async list() { return Promise.all(services.workspaceRegistry.list().map(view)); },
-    async register(path) {
-      if (!isAbsolute(path)) throw new Error('Укажите абсолютный путь к каталогу Host.');
-      if (!(await stat(path)).isDirectory()) throw new Error('Выбранный путь не является каталогом.');
-      await access(path, constants.R_OK | constants.X_OK);
-      const canonical = await realpath(path);
-      return view(await services.workspaceRegistry.create(canonical));
-    },
-    async validate(id) {
-      const entity = services.workspaceRegistry.get(id);
-      if (!entity) throw new Error('Workspace больше не зарегистрирован. Выберите его заново.');
-      const workspace = await view(entity);
-      if (!workspace.available) throw new Error('Каталог workspace отсутствует или недоступен.');
-      return workspace;
-    },
-    async createSession(workspaceId, sessionId) {
-      try { return (await services.sessionController.create({ workspaceId, sessionId })).sessionId; }
-      catch (error) {
-        const partial = error as { data?: { sessionId?: string }; details?: { sessionId?: string } };
-        throw Object.assign(new Error('Не удалось создать или привязать сессию DSH.'), { sessionId: partial.data?.sessionId ?? partial.details?.sessionId });
-      }
-    },
-    async sendPrompt(sessionId, requestId, text) { await services.sessionController.prompt({ sessionId, requestId, mode: 'followup', content: [{ type: 'text', text }] }, new AbortController().signal); },
-    async sessionExists(sessionId) {
-      if (services.workspaceRegistry.archivedSessionIds.includes(sessionId)) return false;
-      return (await services.sessionController.list({}, new AbortController().signal)).items.some(x => x.id === sessionId);
-    },
-  };
-}
+export { createDshAdapter };
 
 export class RedmineHost extends TypertRemoteService {
   static inject = ['storageDomain', 'credentials', 'workspaceRegistry', 'sessionController'];

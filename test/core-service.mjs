@@ -4,9 +4,9 @@ import { PluginService } from '../dist/core/service.js';
 
 const store = () => { const values = new Map(); return { values, async get(k, fallback) { return values.has(k) ? values.get(k) : fallback; }, async set(k,v) { values.set(k,v); } }; };
 const harness = (options = {}) => {
-  const db = options.db ?? store(), sends = [], sessions = new Set(), calls = [], creds = { key: undefined, async resolve(){ return this.key; }, async set(v){ this.key=v; }, async clear(){ this.key=undefined; } };
-  const dsh = { async list(){ return [{id:'w1',name:'Workspace',path:'C:/work',available:true}]; }, async register(path){ return {id:'w1',name:'Workspace',path,available:true}; }, async validate(id){ if(id!=='w1') throw Error('missing'); return {id:'w1',name:'Workspace',path:'C:/work',available:true}; }, async createSession(w,s){ calls.push(['create',w,s]); sessions.add(s); }, async sendPrompt(s,r,p){ calls.push(['send',s,r]); sends.push(p); }, async sessionExists(s){ return sessions.has(s); } };
-  return { db, sends, sessions, calls, creds, dsh, async service(opts={}) { return PluginService.create({store:db,credentials:creds,dsh,logDirectory:'unused',fetch:opts.fetch}); } };
+  const db = options.db ?? store(), sends = [], sessions = new Set(), calls = [], renames = [], creds = { key: undefined, async resolve(){ return this.key; }, async set(v){ this.key=v; }, async clear(){ this.key=undefined; } };
+  const dsh = { async list(){ return [{id:'w1',name:'Workspace',path:'C:/work',available:true}]; }, async register(path){ return {id:'w1',name:'Workspace',path,available:true}; }, async validate(id){ if(id!=='w1') throw Error('missing'); return {id:'w1',name:'Workspace',path:'C:/work',available:true}; }, async createSession(w,s){ calls.push(['create',w,s]); sessions.add(s); }, async sendPrompt(s,r,p){ calls.push(['send',s,r]); sends.push(p); }, async renameSession(s,t){ calls.push(['rename',s,t]); renames.push({sessionId:s,title:t}); }, async sessionExists(s){ return sessions.has(s); } };
+  return { db, sends, sessions, calls, renames, creds, dsh, async service(opts={}) { return PluginService.create({store:db,credentials:creds,dsh,logDirectory:'unused',fetch:opts.fetch}); } };
 };
 const json = (obj, status=200) => new Response(JSON.stringify(obj), {status, headers:{'content-type':'application/json'}});
 
@@ -70,7 +70,17 @@ test('launch retries reuse a session and request ID; duplicate operation is one 
   let fail=true; h.dsh.sendPrompt=async (session,request,prompt)=>{ h.calls.push(['send',session,request]); if(fail){fail=false; throw Error('temporary failure');} h.sends.push(prompt); };
   const op='stable-op'; await assert.rejects(s.call('launch',{issueId:data.rows[0].issue.id,operationId:op}), e=>e.sessionId==='redmine-stable-op');
   const complete=await s.call('launch',{issueId:data.rows[0].issue.id,operationId:op}); const duplicate=await s.call('launch',{issueId:data.rows[0].issue.id,operationId:op});
-  assert.equal(complete.sessionId,duplicate.sessionId); assert.equal(h.calls.filter(x=>x[0]==='create').length,1); assert.equal(h.calls.filter(x=>x[0]==='send').length,2); assert.match(h.sends[0],/демонстрационный запуск/i); assert.match(h.sends[0],/Не вызывай Redmine, MCP или сеть/i); assert.doesNotMatch(h.sends[0],/redmine\.invalid|10000/);
+  assert.equal(complete.sessionId,duplicate.sessionId); assert.equal(h.calls.filter(x=>x[0]==='create').length,1); assert.equal(h.calls.filter(x=>x[0]==='rename').length,1); assert.equal(h.calls.filter(x=>x[0]==='send').length,2); assert.deepEqual(h.calls.map(x=>x[0]),['create','rename','send','send']); assert.equal(h.renames[0].title,data.rows[0].issue.subject); assert.equal(complete.sessionTitle,data.rows[0].issue.subject); assert.equal(complete.titleApplied,true); assert.match(h.sends[0],/демонстрационный запуск/i); assert.match(h.sends[0],/Не вызывай Redmine, MCP или сеть/i); assert.doesNotMatch(h.sends[0],/redmine\.invalid|10000/);
+});
+
+test('failed title operation is retried on the existing session before its prompt', async () => {
+  const h=harness(); const s=await h.service(); const data=await s.call('list',{}); await s.call('selectWorkspace',{issueId:data.rows[0].issue.id,workspaceId:'w1',rememberProject:true});
+  const title=data.rows[0].issue.subject; let fail=true;
+  h.dsh.renameSession=async(session,requestedTitle)=>{ h.calls.push(['rename',session,requestedTitle]); h.renames.push({sessionId:session,title:requestedTitle}); if(fail){fail=false; throw Error('title service unavailable');} };
+  const op='title-retry'; await assert.rejects(s.call('launch',{issueId:data.rows[0].issue.id,operationId:op}), e=>e.sessionId==='redmine-title-retry');
+  const stored=h.db.values.get(`redmine.scope.mock:user:7.launch.${op}`); assert.equal(stored.sessionId,'redmine-title-retry'); assert.equal(stored.status,'failed'); assert.equal(stored.titleApplied,undefined); assert.equal(stored.sessionTitle,title);
+  const complete=await s.call('launch',{issueId:data.rows[0].issue.id,operationId:op});
+  assert.equal(complete.status,'sent'); assert.equal(complete.sessionId,'redmine-title-retry'); assert.equal(complete.titleApplied,true); assert.equal(h.calls.filter(x=>x[0]==='create').length,1); assert.equal(h.calls.filter(x=>x[0]==='rename').length,2); assert.equal(h.calls.filter(x=>x[0]==='send').length,1); assert.deepEqual(h.calls.map(x=>x[0]),['create','rename','rename','send']); assert.ok(h.calls.indexOf(h.calls.find(x=>x[0]==='rename'))<h.calls.findIndex(x=>x[0]==='send')); assert.deepEqual(h.renames.map(x=>x.title),[title,title]);
 });
 
 test('diagnostic records redact credential material and require developer mode', async () => {
