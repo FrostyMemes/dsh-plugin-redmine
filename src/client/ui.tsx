@@ -48,12 +48,36 @@ export function RedminePanel({ api }: PanelProps) {
   const [launchBusy, setLaunchBusy] = useState<number | null>(null);
   const [logOpen, setLogOpen] = useState(false);
   const [launchTemplateId, setLaunchTemplateId] = useState('');
-  const [healthBusy, setHealthBusy] = useState(false);
+  const [scenarioBusy, setScenarioBusy] = useState(false);
+  const [scenarioError, setScenarioError] = useState('');
   const seq = useRef(0);
   const consumedRefresh = useRef(0);
   const firstLoad = useRef(true);
+  const scenarioSaveActive = useRef(false);
+  const remoteSnapshot = useRef<State>();
   const workspaceDialog = useRef<HTMLDialogElement>(null);
   const filterKey = JSON.stringify(filters);
+
+  const acceptState = useCallback((saved: State) => {
+    const previous = remoteSnapshot.current;
+    const sourceChanged = !!previous && (
+      previous.settings.mockEnabled !== saved.settings.mockEnabled ||
+      previous.settings.baseUrl !== saved.settings.baseUrl ||
+      previous.settings.keyConfigured !== saved.settings.keyConfigured
+    );
+    const scenarioChanged = !!previous && previous.settings.mockScenario !== saved.settings.mockScenario;
+    remoteSnapshot.current = saved;
+    setRemote(saved);
+    if (sourceChanged || scenarioChanged) {
+      if (sourceChanged) {
+        setResult(undefined);
+        setFilters(saved.filters ?? { ...DEFAULT_FILTERS });
+      }
+      setBusy(true);
+      setRefreshSeq(current => current + 1);
+    }
+  }, []);
+  const closeLogs = useCallback(() => setLogOpen(false), []);
 
   const clientEvent = useCallback((level: 'info' | 'warning' | 'error', operation: string) => {
     void api.call('clientEvent', { level, operation }).catch(() => undefined);
@@ -61,11 +85,26 @@ export function RedminePanel({ api }: PanelProps) {
 
   useEffect(() => {
     let alive = true;
-    void api.call('state', {}).then(s => { if (alive) { setRemote(s); setFilters(s.filters ?? { ...DEFAULT_FILTERS }); setLaunchTemplateId(s.settings.defaultTemplateId); } })
+    void api.call('state', {}).then(s => { if (alive) { acceptState(s); setFilters(s.filters ?? { ...DEFAULT_FILTERS }); setLaunchTemplateId(s.settings.defaultTemplateId); } })
       .catch(e => { if (alive) { setError(errText(e)); clientEvent('error', 'state'); } })
       .finally(() => { if (alive) setStateReady(true); });
     return () => { alive = false; };
-  }, [api, clientEvent]);
+  }, [api, clientEvent, acceptState]);
+
+  useEffect(() => {
+    let alive = true;
+    const refreshState = () => {
+      if (document.visibilityState === 'hidden') return;
+      void api.call('state', {}).then(saved => { if (alive) acceptState(saved); }).catch(() => undefined);
+    };
+    window.addEventListener('focus', refreshState);
+    document.addEventListener('visibilitychange', refreshState);
+    return () => {
+      alive = false;
+      window.removeEventListener('focus', refreshState);
+      document.removeEventListener('visibilitychange', refreshState);
+    };
+  }, [api, acceptState]);
 
   useEffect(() => {
     if (!stateReady) return;
@@ -125,6 +164,22 @@ export function RedminePanel({ api }: PanelProps) {
     finally { setWorkspaceBusy(false); }
   };
 
+  const saveScenario = async (scenario: MockScenario) => {
+    if (!remote?.settings.developerMode || !remote.settings.mockEnabled || scenarioSaveActive.current) return;
+    scenarioSaveActive.current = true;
+    setScenarioBusy(true); setScenarioError(''); setError('');
+    try {
+      const saved = await api.call('configure', { mockScenario: scenario });
+      acceptState(saved);
+    } catch (e) {
+      const message = errText(e);
+      setScenarioError(message); clientEvent('error', 'configure');
+    } finally {
+      scenarioSaveActive.current = false;
+      setScenarioBusy(false);
+    }
+  };
+
   const launch = async (row: Row, retryOperationId?: string) => {
     if (!row.workspace?.available || launchBusy !== null) return;
     const operationId = retryOperationId ?? (globalThis.crypto?.randomUUID?.() ?? `op-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -150,14 +205,6 @@ export function RedminePanel({ api }: PanelProps) {
     } catch { setNotice('Сессия создана, но её не удалось открыть. Попробуйте открыть её позже.'); return false; }
   };
 
-  const checkHealth = async () => {
-    setHealthBusy(true); setError('');
-    try { const health = await api.call('check', {}); setRemote(prev => prev ? { ...prev, health } : prev); }
-    catch (e) { setError(errText(e)); clientEvent('error', 'check'); }
-    finally { setHealthBusy(false); }
-  };
-  const health = remote?.health;
-
   return <main className="redmine-app" aria-label="Redmine: мои задачи">
     <header className="rm-header">
       <div className="rm-heading"><span className="rm-mark" aria-hidden="true">▤</span><div><h1>Redmine</h1><p>Мои задачи{result?.user?.name ? ` · ${result.user.name}` : ''}</p></div>
@@ -167,7 +214,11 @@ export function RedminePanel({ api }: PanelProps) {
         <button className="rm-icon-button" onClick={() => { window.dispatchEvent(new Event('redmine:open-settings')); }} aria-label="Настройки Redmine" title="Настройки">⚙</button>
       </div>
     </header>
-    <div className="rm-toolbar"><span className="rm-readonly">Только чтение</span><span>{result ? `Обновлено ${fmtDate(result.fetchedAt)}` : remote?.settings.baseUrl || 'Подключение не настроено'}</span>{remote?.settings.developerMode && <button className="rm-link-button" onClick={() => setLogOpen(true)}>Диагностика</button>}</div>
+    <div className="rm-toolbar"><span className="rm-readonly">Только чтение</span><span>{result ? `Обновлено ${fmtDate(result.fetchedAt)}` : remote?.settings.baseUrl || 'Подключение не настроено'}</span>
+      {remote?.settings.developerMode && remote.settings.mockEnabled && <label className="rm-scenario-control"><span>Сценарий демо</span><select value={remote.settings.mockScenario} disabled={scenarioBusy} onChange={event => void saveScenario(event.target.value as MockScenario)}>{SCENARIOS.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select>{scenarioBusy && <span role="status">Сохранение…</span>}</label>}
+      {remote?.settings.developerMode && <button className="rm-link-button" onClick={() => setLogOpen(true)}>Открыть логи</button>}
+    </div>
+    {scenarioError && <div className="rm-error" role="alert">Не удалось сохранить сценарий: {scenarioError}<button onClick={() => setScenarioError('')} aria-label="Скрыть ошибку">×</button></div>}
     {notice && <div className="rm-notice" role="status">{notice}<button onClick={() => setNotice('')} aria-label="Скрыть">×</button></div>}
     {error && <div className="rm-error" role="alert" tabIndex={-1}>{error}<button onClick={() => setError('')} aria-label="Скрыть ошибку">×</button></div>}
     {result?.incomplete && <p className="rm-warning">Данные могут быть неполными. Проверьте предупреждения ниже.</p>}
@@ -185,12 +236,11 @@ export function RedminePanel({ api }: PanelProps) {
     <div className="rm-list-heading"><div><strong>Задачи</strong><span>{busy ? 'Загрузка…' : result ? `${result.total} найдено` : ''}</span></div><label>Шаблон запуска <select aria-label="Шаблон запуска" value={launchTemplateId || remote?.settings.defaultTemplateId || ''} onChange={e => setLaunchTemplateId(e.target.value)} disabled={!remote?.settings.templates.length}>{remote?.settings.templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label><label>На странице <select value={filters.pageSize} onChange={e => updateFilter('pageSize', Number(e.target.value))}><option>25</option><option>50</option><option>100</option></select></label></div>
     {busy && !result && <div className="rm-skeleton" aria-label="Загружаются задачи"><i/><i/><i/></div>}
     {!busy && result && !result.rows.length && <div className="rm-empty"><span aria-hidden="true">⌕</span><strong>Задачи не найдены</strong><p>Измените фильтры или обновите список.</p><button className="rm-secondary" onClick={() => setFilters({ ...DEFAULT_FILTERS })}>Сбросить фильтры</button></div>}
-    {result && <div className={error ? 'rm-issue-list rm-stale' : 'rm-issue-list'} aria-busy={busy}>
-      {error && <div className="rm-stale-label">Показаны ранее загруженные данные</div>}
+    {result && <div className={busy || error ? 'rm-issue-list rm-stale' : 'rm-issue-list'} aria-busy={busy}>
+      {(busy || error) && <div className="rm-stale-label">{error ? 'Показаны ранее загруженные данные' : 'Обновление; показаны предыдущие данные'}</div>}
       {result.rows.map(row => <IssueCard key={row.issue.id} row={row} busy={launchBusy === row.issue.id} globalLaunchBusy={launchBusy !== null} canLaunch={!!row.workspace?.available} onWorkspace={() => void openWorkspace(row.issue)} onLaunch={operationId => void launch(row, operationId)} onOpenSession={openSession} />)}
     </div>}
     {result && <nav className="rm-pagination" aria-label="Страницы задач"><span>Страница {filters.page} из {pages}</span><div><button className="rm-secondary" disabled={filters.page <= 1 || busy} onClick={() => updateFilter('page', filters.page - 1, false)}>Назад</button><button className="rm-secondary" disabled={filters.page >= pages || busy} onClick={() => updateFilter('page', filters.page + 1, false)}>Далее</button></div></nav>}
-    {health && <HealthPanel health={health} onCheck={checkHealth} busy={healthBusy} />}
     {workspaceIssue && <dialog ref={workspaceDialog} className="rm-dialog" aria-modal="true" aria-labelledby="workspace-title" onCancel={e => { e.preventDefault(); setWorkspaceIssue(undefined); }}><div className="rm-dialog-card"><div className="rm-dialog-header"><div><h2 id="workspace-title">Выбрать workspace</h2><p>Задача #{workspaceIssue.id} · {workspaceIssue.project.name}</p></div><button className="rm-icon-button" onClick={() => setWorkspaceIssue(undefined)} aria-label="Закрыть">×</button></div>
       {error && <div className="rm-error" role="alert">{error}</div>}
       <label className="rm-select-label"><span>Проект DSH</span><select value={workspaceChoice} onChange={e => { setWorkspaceChoice(e.target.value); setManualPath(''); }}><option value="">Выберите зарегистрированный workspace</option>{workspaces.map(w => <option key={w.id} value={w.id} disabled={!w.available}>{w.name} — {w.path}{w.available ? '' : ' (недоступен)'}</option>)}</select></label>
@@ -199,7 +249,7 @@ export function RedminePanel({ api }: PanelProps) {
       <p className="rm-dialog-hint">Выберите проект DSH или существующую папку. Новая папка здесь не создаётся.</p>
       <div className="rm-dialog-actions"><button className="rm-secondary" onClick={() => setWorkspaceIssue(undefined)}>Отмена</button><button className="rm-primary" disabled={workspaceBusy || (!workspaceChoice && !manualPath.trim())} onClick={() => void saveWorkspace()}>{workspaceBusy ? 'Проверка…' : 'Выбрать workspace'}</button></div>
     </div></dialog>}
-    <DiagnosticsLogDialog api={api} open={logOpen} enabled={!!remote?.settings.developerMode} onClose={() => setLogOpen(false)} />
+    <DiagnosticsLogDialog api={api} open={logOpen} enabled={!!remote?.settings.developerMode} onState={acceptState} onClose={closeLogs} />
   </main>;
 }
 
@@ -223,7 +273,7 @@ function IssueCard({ row, busy, globalLaunchBusy, canLaunch, onWorkspace, onLaun
   </article>;
 }
 
-function DiagnosticsLogDialog({ api, open, enabled, onClose }: { api: PluginApi; open: boolean; enabled: boolean; onClose: () => void }) {
+function DiagnosticsLogDialog({ api, open, enabled, onState, onClose }: { api: PluginApi; open: boolean; enabled: boolean; onState: (state: State) => void; onClose: () => void }) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [logLevel, setLogLevel] = useState('all');
   const [logSearch, setLogSearch] = useState('');
@@ -247,6 +297,10 @@ function DiagnosticsLogDialog({ api, open, enabled, onClose }: { api: PluginApi;
       if (pullActive.current) return;
       pullActive.current = true;
       try {
+        const current = await api.call('state', {});
+        if (!alive) return;
+        onState(current);
+        if (!current.settings.developerMode) { onClose(); return; }
         const batch = await api.call('logs', { after: cursor.current });
         if (alive && batch.length) {
           const safe = batch.map(sanitizeLog);
@@ -260,7 +314,7 @@ function DiagnosticsLogDialog({ api, open, enabled, onClose }: { api: PluginApi;
     void pull();
     const timer = window.setInterval(pull, 2000);
     return () => { alive = false; window.clearInterval(timer); };
-  }, [api, open, enabled]);
+  }, [api, open, enabled, onState, onClose]);
 
   const visibleLogs = useMemo(() => logs.filter(log =>
     (logLevel === 'all' || log.level === logLevel) &&
@@ -317,14 +371,20 @@ function StatusSelect({ statuses, value, onChange }: { statuses: { id: number; n
     {statuses.map(status => <label className="rm-option" key={status.id}><input type="checkbox" checked={selectedId(status)} onChange={() => toggle(String(status.id))}/><span>{status.name}</span></label>)}
   </div>}</div>;
 }
-function HealthPanel({ health, onCheck, busy }: { health: Health; onCheck: () => void; busy: boolean }) {
-  return <details className="rm-health"><summary><span className={`rm-health-dot ${health.status}`}/><strong>{health.mock ? 'Результат демо-проверки' : 'Состояние подключения'}: {HEALTH_LABELS[health.status]}</strong><span>{health.mock ? 'Демо' : health.user?.name ?? 'Пользователь не определён'} · {fmtDate(health.checkedAt)}{health.stale ? ' · данные устарели' : ''}</span><button className="rm-secondary" onClick={e => { e.preventDefault(); onCheck(); }} disabled={busy}>{busy ? 'Проверка…' : 'Проверить'}</button></summary><ul>{health.steps.map((step, i) => <li key={`${step.name}-${i}`} className={`health-${step.status}`}><span className="rm-health-state">{HEALTH_LABELS[step.status]}</span><strong>{step.name}</strong><span>{step.message}</span>{step.httpStatus && <code>HTTP {step.httpStatus}</code>}</li>)}</ul></details>;
+function HealthResults({ health }: { health: Health }) {
+  return <div className="rm-health-results">
+    <p><strong>{health.mock ? 'Результат демо-проверки' : 'Состояние подключения'}: {HEALTH_LABELS[health.status]}</strong> · {fmtDate(health.checkedAt)}{health.stale ? ' · данные устарели' : ''}{health.user ? ` · ${health.user.name}` : ''}</p>
+    {health.mock && <p className="rm-hint">Проверка выполнена в демо-режиме; соединение с Redmine не проверялось.</p>}
+    {health.steps.map((step, index) => <div className={`rm-health-row health-${step.status}`} key={`${step.name}-${index}`}><strong>{HEALTH_LABELS[step.status]} · {step.name}</strong><span>{step.message}{step.httpStatus ? ` · HTTP ${step.httpStatus}` : ''}</span></div>)}
+  </div>;
 }
 
 export function RedmineSettings({ api }: PanelProps) {
   const [state, setState] = useState<State>();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [modeSaving, setModeSaving] = useState<'mockEnabled' | 'developerMode' | null>(null);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
@@ -332,32 +392,28 @@ export function RedmineSettings({ api }: PanelProps) {
   const [clearKey, setClearKey] = useState(false);
   const [mockEnabled, setMockEnabled] = useState(false);
   const [developerMode, setDeveloperMode] = useState(false);
-  const [scenario, setScenario] = useState<MockScenario>('normal');
   const [templates, setTemplates] = useState<Template[]>([]);
   const [defaultTemplateId, setDefaultTemplateId] = useState('');
   const [health, setHealth] = useState<Health>();
-  const [logOpen, setLogOpen] = useState(false);
 
   useEffect(() => {
     let alive = true;
     void api.call('state', {}).then(saved => {
       if (!alive) return;
       setState(saved); setBaseUrl(saved.settings.baseUrl); setMockEnabled(saved.settings.mockEnabled);
-      setDeveloperMode(saved.settings.developerMode); setScenario(saved.settings.mockScenario);
+      setDeveloperMode(saved.settings.developerMode);
       setTemplates(saved.settings.templates); setDefaultTemplateId(saved.settings.defaultTemplateId); setHealth(saved.health);
     }).catch(e => alive && setError(errText(e))).finally(() => alive && setLoading(false));
     return () => { alive = false; };
   }, [api]);
 
   const save = async (patch: Partial<Omit<Settings, 'keyConfigured'>> & { apiKey?: string; clearKey?: boolean }) => {
+    if (checking || modeSaving) return;
     setSaving(true); setError(''); setMessage('');
     try {
       const saved = await api.call('configure', patch);
       setState(saved); setHealth(saved.health);
       if (patch.baseUrl !== undefined) setBaseUrl(saved.settings.baseUrl);
-      if (patch.mockEnabled !== undefined) setMockEnabled(saved.settings.mockEnabled);
-      if (patch.developerMode !== undefined) setDeveloperMode(saved.settings.developerMode);
-      if (patch.mockScenario !== undefined) setScenario(saved.settings.mockScenario);
       if (patch.templates !== undefined) setTemplates(saved.settings.templates);
       if (patch.templates !== undefined || patch.defaultTemplateId !== undefined) setDefaultTemplateId(saved.settings.defaultTemplateId);
       if (patch.apiKey !== undefined || patch.clearKey === true) { setApiKey(''); setClearKey(false); }
@@ -366,44 +422,60 @@ export function RedmineSettings({ api }: PanelProps) {
     finally { setSaving(false); }
   };
 
+  const saveMode = async (field: 'mockEnabled' | 'developerMode', value: boolean) => {
+    if (!state || saving || checking || modeSaving) return;
+    setModeSaving(field); setError(''); setMessage('');
+    try {
+      const saved = field === 'mockEnabled'
+        ? await api.call('configure', { mockEnabled: value })
+        : await api.call('configure', { developerMode: value });
+      setState(saved); setHealth(saved.health);
+      setMockEnabled(saved.settings.mockEnabled); setDeveloperMode(saved.settings.developerMode);
+      setMessage('Режим сохранён.');
+    } catch (e) {
+      setMockEnabled(state.settings.mockEnabled); setDeveloperMode(state.settings.developerMode);
+      setError(errText(e));
+    } finally { setModeSaving(null); }
+  };
+
   const markHealthStale = () => setHealth(current => current ? { ...current, stale: true } : current);
   const check = async () => {
-    setSaving(true); setError(''); setMessage('');
+    if (!state || saving || modeSaving || checking) return;
+    setChecking(true); setError(''); setMessage('');
     try {
-      const patch = {
-        baseUrl, mockEnabled, developerMode, mockScenario: scenario,
-        ...(apiKey ? { apiKey } : {}), ...(clearKey ? { clearKey: true } : {}),
-      };
-      const saved = await api.call('configure', patch);
-      setState(saved); setHealth(saved.health); setBaseUrl(saved.settings.baseUrl);
-      setMockEnabled(saved.settings.mockEnabled); setDeveloperMode(saved.settings.developerMode); setScenario(saved.settings.mockScenario);
-      setApiKey(''); setClearKey(false);
       const checked = await api.call('check', {});
-      setHealth(checked); setState(current => current ? { ...current, health: checked } : { ...saved, health: checked });
+      setHealth(checked); setState(current => current ? { ...current, health: checked } : current);
       if (checked.mock) setMessage(`Демо-проверка завершена: ${HEALTH_LABELS[checked.status].toLocaleLowerCase('ru-RU')}.`);
       else if (checked.status === 'ok' && checked.user) setMessage(`Подключено: ${checked.user.name}`);
       else setMessage(`Проверка завершена: ${HEALTH_LABELS[checked.status].toLocaleLowerCase('ru-RU')}.`);
     } catch (e) { setError(errText(e)); }
-    finally { setSaving(false); }
+    finally { setChecking(false); }
   };
+
+  const normalizedUrl = (value: string) => {
+    try { return new URL(value.trim()).toString().replace(/\/$/, ''); }
+    catch { return value.trim(); }
+  };
+  const connectionDraftChanged = !state || normalizedUrl(baseUrl) !== normalizedUrl(state.settings.baseUrl) || !!apiKey || clearKey;
+  const settingsBusy = saving || checking || modeSaving !== null;
 
   if (loading) return <section className="redmine-app rm-settings"><div className="rm-skeleton"><i/><i/></div></section>;
   return <section className="redmine-app rm-settings" aria-labelledby="settings-title">
-    <header className="rm-settings-head"><div><h1 id="settings-title">Настройки Redmine</h1><p>Подключение, шаблоны запуска и диагностика.</p></div></header>
+    <header className="rm-settings-head"><div><h1 id="settings-title">Настройки Redmine</h1><p>Подключение, режимы и шаблоны запуска.</p></div></header>
     {error && <div className="rm-error" role="alert" tabIndex={-1}>{error}</div>}{message && <div className="rm-notice" role="status">{message}</div>}
     <section className="rm-settings-section"><h2>Подключение</h2>
       <label className="rm-field"><span>URL Redmine</span><input type="url" value={baseUrl} onChange={event => { setBaseUrl(event.target.value); markHealthStale(); }} placeholder="https://redmine.example.org" autoComplete="url"/></label>
       <label className="rm-field"><span>Персональный API-ключ {state?.settings.keyConfigured && <small>Ключ сохранён</small>}</span><input type="password" value={apiKey} onChange={event => { setApiKey(event.target.value); setClearKey(false); markHealthStale(); }} placeholder={state?.settings.keyConfigured ? 'Оставьте пустым, чтобы сохранить текущий' : 'Введите API-ключ'} autoComplete="new-password"/></label>
       {state?.settings.keyConfigured && <label className="rm-checkbox"><input type="checkbox" checked={clearKey} onChange={event => { setClearKey(event.target.checked); setApiKey(''); markHealthStale(); }}/><span>Удалить сохранённый ключ</span></label>}
-      <div className="rm-inline-actions"><button className="rm-secondary" disabled={saving} onClick={() => void check()}>{saving ? 'Сохранение и проверка…' : 'Сохранить и проверить'}</button><button className="rm-primary" disabled={saving} onClick={() => void save({ baseUrl, ...(apiKey ? { apiKey } : {}), ...(clearKey ? { clearKey: true } : {}) })}>{saving ? 'Сохранение…' : 'Сохранить подключение'}</button></div>
+      <div className="rm-inline-actions"><button className="rm-secondary" disabled={settingsBusy || connectionDraftChanged} onClick={() => void check()}>{checking ? 'Проверка…' : 'Проверить подключение'}</button><button className="rm-primary" disabled={settingsBusy} onClick={() => void save({ baseUrl, ...(apiKey ? { apiKey } : {}), ...(clearKey ? { clearKey: true } : {}) })}>{saving ? 'Сохранение…' : 'Сохранить подключение'}</button></div>
+      {connectionDraftChanged && <p className="rm-hint" role="status">Сохраните подключение перед проверкой.</p>}
+      {health ? <HealthResults health={health}/> : <p className="rm-hint">Проверка ещё не запускалась.</p>}
     </section>
     <section className="rm-settings-section"><h2>Режимы разработки</h2>
-      <label className="rm-checkbox"><input type="checkbox" checked={mockEnabled} onChange={event => { setMockEnabled(event.target.checked); markHealthStale(); }}/><span>Использовать демонстрационные данные</span></label>
-      <label className="rm-checkbox"><input type="checkbox" checked={developerMode} onChange={event => setDeveloperMode(event.target.checked)}/><span>Режим разработчика и журнал диагностики</span></label>
-      {developerMode && <label className="rm-field"><span>Сценарий демонстрации</span><select value={scenario} onChange={event => { setScenario(event.target.value as MockScenario); markHealthStale(); }}>{SCENARIOS.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>}
-      <button className="rm-secondary" disabled={saving} onClick={() => void save({ mockEnabled, developerMode, mockScenario: scenario })}>Сохранить режимы</button>
-      {state?.settings.developerMode && <button className="rm-secondary" disabled={saving} onClick={() => setLogOpen(true)}>Открыть логи</button>}
-      <DiagnosticsLogDialog api={api} open={logOpen} enabled={!!state?.settings.developerMode} onClose={() => setLogOpen(false)} />
+      <p className="rm-hint">Журнал диагностики доступен при включённом режиме разработчика для демо- и реального подключения.</p>
+      <label className="rm-checkbox"><input type="checkbox" checked={mockEnabled} disabled={settingsBusy} onChange={event => { setMockEnabled(event.target.checked); void saveMode('mockEnabled', event.target.checked); }}/><span>Использовать демонстрационные данные</span></label>
+      <label className="rm-checkbox"><input type="checkbox" checked={developerMode} disabled={settingsBusy} onChange={event => { setDeveloperMode(event.target.checked); void saveMode('developerMode', event.target.checked); }}/><span>Режим разработчика и журнал диагностики</span></label>
+      {modeSaving && <p className="rm-hint" role="status">Сохранение режима…</p>}
     </section>
     <section className="rm-settings-section"><h2>Шаблоны запуска</h2>
       <p className="rm-hint">Промпт будет отправлен в новую сессию. Текст задачи и комментарии панель не загружает.</p>
@@ -413,10 +485,7 @@ export function RedmineSettings({ api }: PanelProps) {
         <label className="rm-field"><span>Текст шаблона</span><textarea rows={5} value={template.text} onChange={event => setTemplates(current => current.map((item, i) => i === index ? { ...item, text: event.target.value } : item))}/></label>
         <button className="rm-link-button danger" onClick={() => { const rest = templates.filter(item => item.id !== template.id); setTemplates(rest); if (defaultTemplateId === template.id) setDefaultTemplateId(rest[0]?.id ?? ''); }}>Удалить шаблон</button>
       </article>)}
-      <div className="rm-inline-actions"><button className="rm-secondary" onClick={() => { const template = { id: `template-${Date.now()}`, name: 'Новый шаблон', text: 'Изучи задачу Redmine №{{issue.id}}: {{issue.url}}\n\nРаботай в выбранном workspace DSH.' }; setTemplates(current => [...current, template]); setDefaultTemplateId(template.id); }}>Добавить шаблон</button><button className="rm-primary" disabled={saving || !templates.length || !defaultTemplateId} onClick={() => void save({ templates, defaultTemplateId })}>Сохранить шаблоны</button></div>
-    </section>
-    <section className="rm-settings-section"><div className="rm-settings-section-head"><div><h2>Проверка здоровья</h2><p className="rm-hint">Результат последней проверки по этапам.</p></div><button className="rm-secondary" disabled={saving} onClick={() => void check()}>{saving ? 'Проверка…' : 'Сохранить и проверить'}</button></div>
-      {health ? <div className="rm-health-results"><p><strong>{health.mock ? 'Результат демо-проверки' : 'Состояние подключения'}: {HEALTH_LABELS[health.status]}</strong> · {fmtDate(health.checkedAt)}{health.stale ? ' · устарело' : ''}{health.mock ? ' · демо' : ''}{health.user ? ` · ${health.user.name}` : ''}</p>{health.steps.map((step, index) => <div className={`rm-health-row health-${step.status}`} key={index}><strong>{step.name}</strong><span>{HEALTH_LABELS[step.status]}: {step.message}{step.httpStatus ? ` · HTTP ${step.httpStatus}` : ''}</span></div>)}</div> : <p className="rm-hint">Проверка ещё не запускалась.</p>}
+      <div className="rm-inline-actions"><button className="rm-secondary" disabled={settingsBusy} onClick={() => { const template = { id: `template-${Date.now()}`, name: 'Новый шаблон', text: 'Изучи задачу Redmine №{{issue.id}}: {{issue.url}}\n\nРаботай в выбранном workspace DSH.' }; setTemplates(current => [...current, template]); setDefaultTemplateId(template.id); }}>Добавить шаблон</button><button className="rm-primary" disabled={settingsBusy || !templates.length || !defaultTemplateId} onClick={() => void save({ templates, defaultTemplateId })}>Сохранить шаблоны</button></div>
     </section>
   </section>;
 }
