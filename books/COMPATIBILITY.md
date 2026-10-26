@@ -15,7 +15,9 @@
 
 ## Redmine
 
-Сервер недоступен, точный релиз и права неизвестны. Годы 2022–2023 обозначают возраст установки/обновления, а не гарантированную версию API.
+Пользователь 26.10.2026 эмпирически установил ветку корпоративного сервера: **Redmine 4.1.x**. Точный patch, права и изменения инстанса неизвестны; подключение плагина к серверу ещё не проверялось. Годы 2022–2023 и copyright в подвале сами по себе не определяют номер версии.
+
+В исходниках официального зеркала ветки `4.1-stable` проверены [выдача деталей проекта](https://github.com/redmine/redmine/blob/4.1-stable/app/views/projects/show.api.rsb), [вложенные trackers/issue_categories](https://github.com/redmine/redmine/blob/4.1-stable/app/helpers/projects_helper.rb) и [постраничный API списка задач](https://github.com/redmine/redmine/blob/4.1-stable/app/controllers/issues_controller.rb). Формат вложенных справочников соответствует реализации 0.1.5. Это сверка с исходниками ветки, не проверка фактической корпоративной сборки.
 
 Реализация использует базовые GET endpoints: `users/current.json`, `projects.json`, `issues.json`, `issue_statuses.json`, `enumerations/issue_priorities.json` и детали проекта с `include=trackers,issue_categories`. Общий `trackers.json` не вызывается: типы задач собираются из деталей доступных проектов. Отдельный endpoint категорий заменён согласно списку маршрутов инстанса, предоставленному пользователем; [карта endpoints и границы использования](REDMINE_ENDPOINTS.md). Не предполагаются современные endpoint health/version либо расширенные фильтры. Пользователь текущего API нормализуется из `firstname/lastname/login`; названия словарей читаются с сервера.
 
