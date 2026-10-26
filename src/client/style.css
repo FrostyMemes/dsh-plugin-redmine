@@ -133,6 +133,7 @@
 .rm-template-help-tooltip dt code { color: var(--rm-accent); white-space: nowrap; }
 .rm-template-help-tooltip dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.rm-template-title > .rm-field { margin-bottom: 0; }
 @media (max-width: 650px) {
   .redmine-app { padding: 14px 12px 28px; }
   .rm-heading h1 { font-size: 20px; }.rm-mark { width: 36px; height: 36px; }.rm-toolbar { flex-wrap: wrap; gap: 7px; margin: 5px 0 13px; }
@@ -141,6 +142,6 @@
   .rm-list-heading { align-items: flex-start; gap: 8px; }
   .rm-template-picker-row label { align-items: flex-start; flex-direction: column; gap: 3px; }
   .rm-health-row { grid-template-columns: 1fr; gap: 4px; }
-  .rm-dialog { padding: 10px; }.rm-dialog-card { max-height: calc(100vh - 20px); margin-top: 4vh; padding: 16px; }.rm-path-picker { flex-direction: column; }.rm-dialog-actions { position: sticky; bottom: -16px; background: var(--rm-bg); padding: 10px 0; }.rm-log-controls { grid-template-columns: 1fr 1fr; }.rm-log-controls input { grid-column: 1 / -1; }.rm-log-entry summary { grid-template-columns: 1fr auto; }.rm-log-entry summary > *:nth-child(n+3) { grid-column: 1 / -1; }.rm-template-title { grid-template-columns: 1fr; gap: 0; }.rm-template-title .rm-checkbox { margin-top: 0; }.rm-settings { padding: 12px; }.rm-settings-section { padding: 14px; }.rm-inline-actions { flex-direction: column-reverse; }.rm-inline-actions > button { width: 100%; }
+  .rm-dialog { padding: 10px; }.rm-dialog-card { max-height: calc(100vh - 20px); margin-top: 4vh; padding: 16px; }.rm-path-picker { flex-direction: column; }.rm-dialog-actions { position: sticky; bottom: -16px; background: var(--rm-bg); padding: 10px 0; }.rm-log-controls { grid-template-columns: 1fr 1fr; }.rm-log-controls input { grid-column: 1 / -1; }.rm-log-entry summary { grid-template-columns: 1fr auto; }.rm-log-entry summary > *:nth-child(n+3) { grid-column: 1 / -1; }.rm-template-title { grid-template-columns: 1fr; gap: 0; }.rm-template-title > .rm-field { margin-bottom: 13px; }.rm-template-title .rm-checkbox { margin-top: 0; }.rm-settings { padding: 12px; }.rm-settings-section { padding: 14px; }.rm-inline-actions { flex-direction: column-reverse; }.rm-inline-actions > button { width: 100%; }
 }
 @media (prefers-color-scheme: light) { .redmine-app, .rm-main-root { --rm-bg: var(--background-primary, #f7f8fa); --rm-surface: var(--background-secondary, #fff); --rm-surface-raised: var(--background-tertiary, #f0f2f5); --rm-text: var(--text-primary, #20242a); --rm-muted: var(--text-secondary, #69727e); --rm-border: var(--border-color, #d9dde3); --rm-accent: var(--accent-color, #2869cc); --rm-accent-hover: var(--accent-hover, #1d58b3); } }
