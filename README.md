@@ -39,7 +39,7 @@ npm pack --pack-destination .dev
 В DSH откройте **Plugins → Add plugin** и укажите абсолютный путь к полученному `.tgz`. Альтернатива через CLI:
 
 ```powershell
-dsh plugin --profile <ваш-профиль> add 'C:\path\to\dsh-plugin-redmine-0.1.5.tgz'
+dsh plugin --profile <ваш-профиль> add 'C:\path\to\dsh-plugin-redmine-0.2.0.tgz'
 ```
 
 Перезапустите профиль при запросе DSH. В глобальной навигации появится **Redmine**, а на странице Bundle — настройки плагина.

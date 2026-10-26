@@ -44,6 +44,8 @@ export class PluginService {
   private ns = 'unconfigured';
   private busy = new Map<string, Promise<Launch>>();
   private generation = 0;
+  private contextGeneration = 0;
+  private confirmationTokens = new Map<string, { issueId: number; generation: number; contextGeneration: number; scope: string; expiresAt: number }>();
   private controller = new AbortController();
   private logChain: Promise<void> = Promise.resolve();
   private listQueue: Promise<void> = Promise.resolve();
@@ -70,7 +72,7 @@ export class PluginService {
     const initialKey = await this.o.credentials.resolve(); this.rememberKey(initialKey); this.settings.keyConfigured = !!initialKey;
   }
   private scopePrefix(settings = this.settings) { if (settings.mockEnabled) return 'mock'; try { return settings.baseUrl ? `real:${normUrl(settings.baseUrl)}` : 'real:unconfigured'; } catch { return 'real:invalid'; } }
-  private invalidateRequests() { this.generation++; this.controller.abort(); this.controller = new AbortController(); }
+  private invalidateRequests() { this.generation++; this.contextGeneration++; this.confirmationTokens.clear(); this.controller.abort(); this.controller = new AbortController(); }
   private rememberKey(key?: string) { if (key && !this.redactionKeys.includes(key)) this.redactionKeys.push(key); }
   private safeText(value: unknown) { let text = safeMessage(value); for (const secret of this.redactionKeys) text = text.split(secret).join('[redacted]'); return text.slice(0, 240); }
   private assertGeneration(generation: number) { if (generation !== this.generation) throw new Error('Operation superseded by a configuration change'); }
@@ -95,10 +97,11 @@ export class PluginService {
       case 'logs': return await this.readLogs(x) as any;
       case 'clientEvent': return await this.clientEvent(x) as any;
       case 'sessionAvailable': return { available: await this.o.dsh.sessionExists(x.sessionId) } as any;
+      case 'issueSessions': return await this.issueSessions(x.issueId, x.expectedContextGeneration) as any;
       default: throw new Error('Unsupported action');
     }
   }
-  private async state(): Promise<State> { this.settings.keyConfigured = !!(await this.o.credentials.resolve()); return { settings: { ...this.settings, templates: this.settings.templates.map(t => ({ ...t })), keyConfigured: this.settings.keyConfigured }, filters: { ...this.filters }, ...(this.health ? { health: this.health } : {}) }; }
+  private async state(): Promise<State> { this.settings.keyConfigured = !!(await this.o.credentials.resolve()); return { settings: { ...this.settings, templates: this.settings.templates.map(t => ({ ...t })), keyConfigured: this.settings.keyConfigured }, filters: { ...this.filters }, contextGeneration: this.contextGeneration, ...(this.health ? { health: this.health } : {}) }; }
   private async configure(p: Partial<Settings> & { apiKey?: string; clearKey?: boolean }): Promise<State> {
     const previous = this.configuring; let release!: () => void; this.configuring = new Promise<void>(resolve => { release = resolve; });
     await previous;
@@ -211,13 +214,13 @@ export class PluginService {
       const scope = this.ns; await this.o.store.set(`redmine.scope.${scope}.filters`, { ...this.filters }); this.assertGeneration(generation);
     }
     if (!opts.refresh && !projectScopeChanged && this.data) { const view = await this.attachLocalMetadata(this.applyFilters(this.data)); this.assertGeneration(generation); return view; }
-    try { const result = this.settings.mockEnabled ? await this.mockList(generation) : await this.realList(generation, opts.filters); this.assertGeneration(generation); this.data = result; const view = await this.attachLocalMetadata(this.applyFilters(result)); this.assertGeneration(generation); return view; }
+    try { const result = this.settings.mockEnabled ? await this.mockList(generation) : await this.realList(generation, opts.filters); this.assertGeneration(generation); result.contextGeneration = this.contextGeneration; this.data = result; const view = await this.attachLocalMetadata(this.applyFilters(result)); this.assertGeneration(generation); return view; }
     catch (e) { if (generation !== this.generation) throw new Error('Operation superseded by a configuration change'); const message = this.safeText(e); await this.log('error', 'list', 'Issue list refresh failed', { message }); if (this.health) { this.health = { ...this.health, stale: true }; await this.persistHealth(); } throw new Error(message); }
   }
   private async mockList(generation: number): Promise<ListResult> {
     const scenario = this.settings.mockScenario; if (scenario === 'slow') await new Promise(r => setTimeout(r, 500)); if (scenario === 'load-error' || scenario === 'refresh-error' || scenario === 'forbidden') throw new Error(scenario === 'forbidden' ? 'Демо: смоделирован отказ в доступе' : 'Демо: ошибка загрузки');
     this.assertGeneration(generation); const d = mockDataset(); await this.setUserScope(d.user, generation); this.assertGeneration(generation); const issues = scenario === 'empty' ? [] : d.issues.filter(i => i.assignedTo?.id === d.user.id), catalog: Catalog = { projects: d.projects, statuses: d.statuses, trackers: d.trackers, priorities: d.priorities, categories: d.categories, warnings: [] };
-    return { rows: issues.map(issue => ({ issue, launches: [] })), total: issues.length, catalog, filters: { ...this.filters }, fetchedAt: now(), incomplete: false, user: d.user };
+    return { rows: issues.map(issue => ({ issue, launches: [] })), total: issues.length, catalog, filters: { ...this.filters }, fetchedAt: now(), incomplete: false, user: d.user, contextGeneration: this.contextGeneration };
   }
   private async realList(generation: number, filterOverride?: Partial<Filters>): Promise<ListResult> {
     const ctx = await this.requestContext(generation); const get = (path: string) => this.getJson(path, ctx);
@@ -305,7 +308,7 @@ export class PluginService {
     }
     catalog.trackers = [...trackerById.values()].sort((a, b) => a.id - b.id);
     this.assertGeneration(generation);
-    return { rows: issues.map(issue => ({ issue, launches: [] })), total: itotal, catalog, filters: { ...this.filters }, fetchedAt: now(), incomplete, user };
+    return { rows: issues.map(issue => ({ issue, launches: [] })), total: itotal, catalog, filters: { ...this.filters }, fetchedAt: now(), incomplete, user, contextGeneration: this.contextGeneration };
   }
   private applyFilters(base: ListResult): ListResult {
     const search = this.filters.search.trim(), exactId = search.startsWith('#') ? search.slice(1).trim() : undefined;
@@ -324,7 +327,7 @@ export class PluginService {
     this.assertGeneration(generation);
     if (next !== this.ns) {
       const saved = await this.o.store.get<Partial<Filters>>(`redmine.scope.${next}.filters`, {}); this.assertGeneration(generation);
-      this.ns = next; this.filters = { ...DEFAULT_FILTERS, statuses: ['open'], ...saved }; this.data = undefined;
+      this.ns = next; this.contextGeneration++; this.confirmationTokens.clear(); this.filters = { ...DEFAULT_FILTERS, statuses: ['open'], ...saved }; this.data = undefined;
       if (this.health && this.health.user?.id !== user.id) { this.health = { ...this.health, user: undefined, stale: true }; await this.persistHealth(); this.assertGeneration(generation); }
     }
   }
@@ -338,6 +341,43 @@ export class PluginService {
       return { ...r, ...(workspace ? { workspace } : {}), launches };
     }));
     return { ...result, rows };
+  }
+  private async issueSessions(issueId: number, expectedContextGeneration: number): Promise<{ sessions: Launch[]; confirmationToken: string }> {
+    const generation = this.generation, contextGeneration = this.contextGeneration, scope = this.ns;
+    if (expectedContextGeneration !== contextGeneration) throw new Error('Issue list context changed; refresh the list and check existing sessions again');
+    if (!this.data?.rows.some(row => row.issue.id === issueId)) throw new Error('Issue is not in the loaded metadata list');
+    const launches = await this.o.store.get<Launch[]>(`redmine.scope.${scope}.issueLaunches.${issueId}`, []);
+    this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    const recorded = launches.filter(item => item.issueId === issueId && typeof item.sessionId === 'string' && item.sessionId.length > 0);
+    const sessionIds = await this.o.dsh.existingSessions(recorded.map(item => item.sessionId));
+    this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    const available = new Set(sessionIds);
+    const latestBySession = new Map<string, Launch>();
+    for (const launch of recorded) {
+      if (!available.has(launch.sessionId)) continue;
+      const previous = latestBySession.get(launch.sessionId);
+      if (!previous || launch.createdAt > previous.createdAt) latestBySession.set(launch.sessionId, launch);
+    }
+    const sessions = [...latestBySession.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const timestamp = Date.now();
+    for (const [token, record] of this.confirmationTokens) if (record.expiresAt <= timestamp) this.confirmationTokens.delete(token);
+    const confirmationToken = id();
+    this.confirmationTokens.set(confirmationToken, { issueId, generation, contextGeneration, scope, expiresAt: timestamp + 2 * 60_000 });
+    return { sessions, confirmationToken };
+  }
+  private assertContextGeneration(contextGeneration: number) {
+    if (contextGeneration !== this.contextGeneration) throw new Error('Operation superseded by a context change');
+  }
+  private validateConfirmationToken(token: string | undefined, issueId: number, generation: number, contextGeneration: number, scope: string) {
+    const record = token ? this.confirmationTokens.get(token) : undefined;
+    if (!record || record.issueId !== issueId || record.generation !== generation || record.contextGeneration !== contextGeneration || contextGeneration !== this.contextGeneration || record.scope !== scope || record.expiresAt <= Date.now()) {
+      if (token) this.confirmationTokens.delete(token);
+      throw new Error('Launch confirmation is stale or expired; check existing sessions again');
+    }
+  }
+  private consumeConfirmationToken(token: string | undefined, issueId: number, generation: number, contextGeneration: number, scope: string) {
+    this.validateConfirmationToken(token, issueId, generation, contextGeneration, scope);
+    this.confirmationTokens.delete(token!);
   }
   private async selectWorkspace(input: Commands['selectWorkspace']['input']): Promise<Workspace> {
     const generation = this.generation, scope = this.ns;
@@ -363,37 +403,39 @@ export class PluginService {
     const task = this.doLaunch(input).finally(() => this.busy.delete(key)); this.busy.set(key, task); return task;
   }
   private async doLaunch(input: Commands['launch']['input']): Promise<Launch> {
-    await this.configuring; const generation = this.generation, scope = this.ns;
+    await this.configuring; const generation = this.generation, contextGeneration = this.contextGeneration, scope = this.ns;
     if (!input.operationId || input.operationId.length > 120) throw new Error('Invalid operation ID');
+    const storageKey = `redmine.scope.${scope}.launch.${input.operationId}`;
+    let launch = await this.o.store.get<Launch | undefined>(storageKey, undefined); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    if (!launch) this.validateConfirmationToken(input.confirmationToken, input.issueId, generation, contextGeneration, scope);
     const issue = this.data?.rows.find(r => r.issue.id === input.issueId)?.issue; if (!issue) throw new Error('Issue metadata is not loaded');
+    if (launch && launch.issueId !== issue.id) throw new Error('Operation ID is already bound to a different launch');
+    if (launch?.status === 'sent') return launch;
     const mockMode = this.settings.mockEnabled, template = this.settings.templates.find(x => x.id === (input.templateId ?? this.settings.defaultTemplateId)) ?? this.settings.templates.find(x => x.id === this.settings.defaultTemplateId);
     if (!template) throw new Error('Template not found');
-    const projectMap = await this.o.store.get<Record<string, string>>(`redmine.scope.${scope}.projectWorkspaces`, {}); this.assertGeneration(generation);
-    const issueMap = await this.o.store.get<Record<string, string>>(`redmine.scope.${scope}.issueWorkspaces`, {}); this.assertGeneration(generation);
+    const projectMap = await this.o.store.get<Record<string, string>>(`redmine.scope.${scope}.projectWorkspaces`, {}); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    const issueMap = await this.o.store.get<Record<string, string>>(`redmine.scope.${scope}.issueWorkspaces`, {}); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
     const workspaceId = issueMap[String(issue.id)] ?? projectMap[String(issue.project.id)]; if (!workspaceId) throw new Error('Select a workspace before starting a task');
-    const workspace = await this.o.dsh.validate(workspaceId); this.assertGeneration(generation);
-    const storageKey = `redmine.scope.${scope}.launch.${input.operationId}`;
-    let launch = await this.o.store.get<Launch | undefined>(storageKey, undefined); this.assertGeneration(generation);
-    if (launch?.status === 'sent') return launch;
-    if (!launch) { launch = { operationId: input.operationId, issueId: issue.id, workspaceId: workspace.id, sessionId: `redmine-${input.operationId}`, requestId: input.operationId, sessionTitle: issue.subject, status: 'creating', createdAt: now() }; await this.o.store.set(storageKey, launch); this.assertGeneration(generation); await this.recordLaunch(launch, scope); this.assertGeneration(generation); }
+    const workspace = await this.o.dsh.validate(workspaceId); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    if (!launch) { this.consumeConfirmationToken(input.confirmationToken, issue.id, generation, contextGeneration, scope); launch = { operationId: input.operationId, issueId: issue.id, workspaceId: workspace.id, sessionId: `redmine-${input.operationId}`, requestId: input.operationId, sessionTitle: issue.subject, status: 'creating', createdAt: now() }; await this.o.store.set(storageKey, launch); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration); await this.recordLaunch(launch, scope); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration); }
     else if (launch.issueId !== issue.id || launch.workspaceId !== workspace.id) throw new Error('Operation ID is already bound to a different launch');
     else launch = { ...launch, sessionTitle: launch.sessionTitle ?? issue.subject };
     try {
       if (launch.status === 'failed') {
-        const exists = await this.o.dsh.sessionExists(launch.sessionId); this.assertGeneration(generation);
+        const exists = await this.o.dsh.sessionExists(launch.sessionId); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
         launch = { ...launch, status: exists ? 'sending' : 'creating', titleApplied: exists ? launch.titleApplied : false, error: undefined };
       }
       if (launch.status === 'creating') {
         const createdId = await this.o.dsh.createSession(launch.workspaceId, launch.sessionId);
         if (createdId) launch = { ...launch, sessionId: createdId };
-        this.assertGeneration(generation);
-        launch = { ...launch, status: 'sending' }; await this.o.store.set(storageKey, launch); this.assertGeneration(generation); await this.recordLaunch(launch, scope); this.assertGeneration(generation);
+        this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+        launch = { ...launch, status: 'sending' }; await this.o.store.set(storageKey, launch); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration); await this.recordLaunch(launch, scope); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
       }
       if (!launch.titleApplied) {
         await this.o.dsh.renameSession(launch.sessionId, launch.sessionTitle ?? issue.subject);
-        this.assertGeneration(generation);
+        this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
         launch = { ...launch, sessionTitle: launch.sessionTitle ?? issue.subject, titleApplied: true };
-        await this.o.store.set(storageKey, launch); this.assertGeneration(generation); await this.recordLaunch(launch, scope); this.assertGeneration(generation);
+        await this.o.store.set(storageKey, launch); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration); await this.recordLaunch(launch, scope); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
       }
       const quote = (v: string) => JSON.stringify(v);
       const promptBody = template.text.replace(/{{\s*([^}]+?)\s*}}/g, (_m, k: string) => {
@@ -403,9 +445,9 @@ export class PluginService {
         ? 'Это демонстрационный запуск. Не вызывай Redmine, MCP или сеть, не изменяй файлы. Объясни, что для реальной работы нужно отключить демонстрационный режим и выбрать задачу в Redmine.'
         : promptBody;
       await this.o.dsh.sendPrompt(launch.sessionId, launch.requestId, prompt);
-      this.assertGeneration(generation);
-      launch = { ...launch, status: 'sent' }; await this.o.store.set(storageKey, launch); this.assertGeneration(generation);
-      await this.recordLaunch(launch, scope); this.assertGeneration(generation);
+      this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      launch = { ...launch, status: 'sent' }; await this.o.store.set(storageKey, launch); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      await this.recordLaunch(launch, scope); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
       this.data!.rows = this.data!.rows.map(r => r.issue.id === issue.id ? { ...r, launches: [...r.launches.filter(x => x.operationId !== launch!.operationId), launch!] } : r);
       await this.log('info', 'launch', 'Task session started', { issueId: issue.id, workspaceId: workspace.id, sessionId: launch.sessionId, requestId: launch.requestId }); return launch;
     } catch (e) {
@@ -421,7 +463,7 @@ export class PluginService {
     const rows = await this.o.store.get<Launch[]>(key, []); const updated = [...rows.filter(x => x.operationId !== launch.operationId), launch]; await this.o.store.set(key, updated);
   }
   private async clientEvent(input: Commands['clientEvent']['input']) {
-    const allowed = new Set(['state', 'configure', 'check', 'list', 'refresh', 'workspaces', 'selectWorkspace', 'launch', 'openSession', 'sessionAvailable', 'filter', 'search', 'sort', 'page']);
+    const allowed = new Set(['state', 'configure', 'check', 'list', 'refresh', 'workspaces', 'selectWorkspace', 'launch', 'openSession', 'sessionAvailable', 'issueSessions', 'filter', 'search', 'sort', 'page']);
     if (!allowed.has(input.operation)) return { accepted: false };
     await this.log(input.level, 'client', 'Client event', { operation: input.operation }); return { accepted: true };
   }

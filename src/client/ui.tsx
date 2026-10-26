@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Filters, Health, Issue, Launch, ListResult, LogEntry, MockScenario, PluginApi, Row, Settings, State, Template, Workspace } from '../shared/contracts.js';
 import { DEFAULT_FILTERS } from '../shared/contracts.js';
+import { advanceEpoch, isCurrentEpoch } from '../shared/epoch.js';
+import { claimOnce } from '../shared/one-shot.js';
 import { sanitizeRuntimeText } from '../diagnostics/runtime.js';
 
 type PanelProps = { api: PluginApi };
@@ -136,6 +138,8 @@ export function RedminePanel({ api }: PanelProps) {
   const [rememberProject, setRememberProject] = useState(true);
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
   const [launchBusy, setLaunchBusy] = useState<number | null>(null);
+  const [launchConfirmation, setLaunchConfirmation] = useState<{ row: Row; sessions: Launch[]; confirmationToken: string; epoch: number }>();
+  const [launchConfirmationBusy, setLaunchConfirmationBusy] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
   const [launchTemplateId, setLaunchTemplateId] = useState('');
   const [scenarioBusy, setScenarioBusy] = useState(false);
@@ -146,22 +150,34 @@ export function RedminePanel({ api }: PanelProps) {
   const scenarioSaveActive = useRef(false);
   const remoteSnapshot = useRef<State>();
   const workspaceDialog = useRef<HTMLDialogElement>(null);
+  const launchConfirmationDialog = useRef<HTMLDialogElement>(null);
+  const launchChoiceClaimed = useRef(false);
+  const launchConfirmationStarting = useRef(false);
+  const launchPreflightEpoch = useRef(0);
   const filterKey = JSON.stringify(filters);
 
   const acceptState = useCallback((saved: State) => {
     const previous = remoteSnapshot.current;
+    if (previous && saved.contextGeneration < previous.contextGeneration) return;
     const sourceChanged = !!previous && (
       previous.settings.mockEnabled !== saved.settings.mockEnabled ||
       previous.settings.baseUrl !== saved.settings.baseUrl ||
-      previous.settings.keyConfigured !== saved.settings.keyConfigured
+      previous.settings.keyConfigured !== saved.settings.keyConfigured ||
+      previous.contextGeneration !== saved.contextGeneration
     );
     const scenarioChanged = !!previous && previous.settings.mockScenario !== saved.settings.mockScenario;
     remoteSnapshot.current = saved;
     setRemote(saved);
     if (sourceChanged || scenarioChanged) {
       if (sourceChanged) {
+        advanceEpoch(launchPreflightEpoch);
         setResult(undefined);
         setFilters(saved.filters ?? { ...DEFAULT_FILTERS });
+        setLaunchConfirmation(undefined);
+        launchChoiceClaimed.current = false;
+        launchConfirmationStarting.current = false;
+        setLaunchBusy(null);
+        setLaunchConfirmationBusy(false);
       }
       setBusy(true);
       setRefreshSeq(current => current + 1);
@@ -228,6 +244,14 @@ export function RedminePanel({ api }: PanelProps) {
     dialog.querySelector<HTMLElement>('select, input, button')?.focus();
     return () => { if (dialog.open) dialog.close(); };
   }, [!!workspaceIssue]);
+  useEffect(() => {
+    const dialog = launchConfirmationDialog.current;
+    if (!launchConfirmation || !dialog) return;
+    if (!dialog.open) dialog.showModal();
+    dialog.querySelector<HTMLElement>('.rm-session-confirm-link, .rm-primary')?.focus();
+    return () => { if (dialog.open) dialog.close(); };
+  }, [!!launchConfirmation]);
+  useEffect(() => () => { advanceEpoch(launchPreflightEpoch); }, []);
   const updateFilter = <K extends keyof Filters>(key: K, value: Filters[K], resetPage = true) => setFilters(current => ({ ...current, [key]: value, ...(resetPage ? { page: 1 } : {}) }));
   const catalog = result?.catalog;
   const pages = Math.max(1, Math.ceil((result?.total ?? 0) / (filters.pageSize || 25)));
@@ -271,29 +295,90 @@ export function RedminePanel({ api }: PanelProps) {
     }
   };
 
-  const launch = async (row: Row, retryOperationId?: string) => {
-    if (!row.workspace?.available || launchBusy !== null) return;
+  const executeLaunch = async (row: Row, retryOperationId?: string, confirmationToken?: string, isCurrent: () => boolean = () => true) => {
     const operationId = retryOperationId ?? (globalThis.crypto?.randomUUID?.() ?? `op-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    setLaunchBusy(row.issue.id); setError(''); setNotice('');
     try {
       const templateId = remote?.settings.templates.some(template => template.id === launchTemplateId) ? launchTemplateId : remote?.settings.defaultTemplateId;
-      const started = await api.call('launch', { issueId: row.issue.id, operationId, ...(templateId ? { templateId } : {}) });
+      const started = await api.call('launch', { issueId: row.issue.id, operationId, ...(templateId ? { templateId } : {}), ...(confirmationToken ? { confirmationToken } : {}) });
+      if (!isCurrent()) return;
       setResult(current => current ? ({ ...current, rows: current.rows.map(r => r.issue.id === row.issue.id ? { ...r, launches: [started, ...r.launches.filter(x => x.operationId !== started.operationId)] } : r) }) : current);
       if (started.status === 'failed') { setError(started.error || 'Не удалось запустить сессию. Повторите попытку.'); clientEvent('error', 'launch'); return; }
       setNotice(started.status === 'sent' ? 'Промпт отправлен в новую сессию.' : 'Сессия создана. Проверяем доступность…');
-      if (remote?.settings.openCreatedSession !== false) await openSession(started);
+      if (remote?.settings.openCreatedSession !== false) await openSession(started, isCurrent);
     } catch (e) {
+      if (!isCurrent()) return;
       setError(`${errText(e)} Повторите отправку из истории запусков, если операция была сохранена.`); clientEvent('error', 'launch');
-      try { setResult(await api.call('list', { filters })); } catch { /* the existing issue list remains visible */ }
+      try { const refreshed = await api.call('list', { filters }); if (isCurrent()) setResult(refreshed); } catch { /* the existing issue list remains visible */ }
     }
-    finally { setLaunchBusy(null); }
   };
-  const openSession = async (launchItem: Launch) => {
+  const launch = async (row: Row, retryOperationId?: string) => {
+    if (!row.workspace?.available || launchBusy !== null) return;
+    const epoch = advanceEpoch(launchPreflightEpoch);
+    const isCurrent = () => isCurrentEpoch(launchPreflightEpoch, epoch);
+    launchChoiceClaimed.current = false;
+    launchConfirmationStarting.current = false;
+    setLaunchConfirmationBusy(false);
+    setLaunchBusy(row.issue.id); setError(''); setNotice('');
+    let waitingForChoice = false;
+    try {
+      if (retryOperationId) {
+        await executeLaunch(row, retryOperationId, undefined, isCurrent);
+        return;
+      }
+      const expectedContextGeneration = result?.contextGeneration;
+      if (expectedContextGeneration === undefined) throw new Error('Обновите список задач и повторите попытку');
+      const { sessions: existingSessions, confirmationToken } = await api.call('issueSessions', { issueId: row.issue.id, expectedContextGeneration });
+      if (!isCurrent()) return;
+      if (existingSessions.length) {
+        waitingForChoice = true;
+        setLaunchConfirmation({ row, sessions: existingSessions, confirmationToken, epoch });
+        return;
+      }
+      await executeLaunch(row, undefined, confirmationToken, isCurrent);
+    } catch (e) {
+      if (!isCurrent()) return;
+      setError(`Не удалось проверить существующие сессии: ${errText(e)}. Повторите попытку.`);
+      clientEvent('error', 'issueSessions');
+    } finally {
+      if (isCurrent() && !waitingForChoice) setLaunchBusy(null);
+    }
+  };
+  const cancelLaunchConfirmation = () => {
+    if (!launchConfirmation || !claimOnce(launchChoiceClaimed)) return;
+    advanceEpoch(launchPreflightEpoch);
+    setLaunchConfirmation(undefined);
+    setLaunchConfirmationBusy(false);
+    setLaunchBusy(null);
+  };
+  const confirmNewSession = async () => {
+    const pending = launchConfirmation;
+    if (!pending || !isCurrentEpoch(launchPreflightEpoch, pending.epoch) || launchBusy !== pending.row.issue.id || !claimOnce(launchChoiceClaimed)) return;
+    const isCurrent = () => isCurrentEpoch(launchPreflightEpoch, pending.epoch);
+    launchConfirmationStarting.current = true;
+    setLaunchConfirmationBusy(true);
+    try { await executeLaunch(pending.row, undefined, pending.confirmationToken, isCurrent); }
+    finally {
+      if (!isCurrent()) return;
+      launchConfirmationStarting.current = false;
+      setLaunchConfirmation(undefined);
+      setLaunchConfirmationBusy(false);
+      setLaunchBusy(null);
+    }
+  };
+  const openExistingSession = (launchItem: Launch) => {
+    if (!launchConfirmation || !claimOnce(launchChoiceClaimed)) return;
+    const epoch = advanceEpoch(launchPreflightEpoch);
+    setLaunchConfirmation(undefined);
+    setLaunchBusy(null);
+    void openSession(launchItem, () => isCurrentEpoch(launchPreflightEpoch, epoch));
+  };
+  const openSession = async (launchItem: Launch, isCurrent: () => boolean = () => true) => {
     try {
       const available = await api.call('sessionAvailable', { sessionId: launchItem.sessionId });
+      if (!isCurrent()) return false;
       if (!available.available) { setNotice('Сессия пока недоступна для открытия. Её можно проверить повторно из истории запусков.'); return false; }
       await api.openSession(launchItem.sessionId); return true;
-    } catch { setNotice('Сессия создана, но её не удалось открыть. Попробуйте открыть её позже.'); return false; }
+    } catch { if (isCurrent()) setNotice('Сессия создана, но её не удалось открыть. Попробуйте открыть её позже.'); return false; }
   };
 
   return <main className="redmine-app" aria-label="Redmine: мои задачи">
@@ -315,16 +400,17 @@ export function RedminePanel({ api }: PanelProps) {
     {result?.incomplete && <p className="rm-warning">Данные могут быть неполными. Проверьте предупреждения ниже.</p>}
     {catalog?.warnings?.length ? <details className="rm-warnings"><summary>Ограничения справочников ({catalog.warnings.length})</summary><ul>{catalog.warnings.map((warning, i) => <li key={i}>{warning}</li>)}</ul></details> : null}
     <section className="rm-filters" aria-label="Фильтры задач">
-      <label className="rm-search"><span className="sr-only">Поиск по номеру или названию</span><span aria-hidden="true">⌕</span><input value={filters.search} onChange={e => updateFilter('search', e.target.value)} placeholder="Поиск по № или названию" /></label>
+      <label className="rm-search"><span className="rm-filter-caption">Поиск</span><span className="rm-search-control"><span aria-hidden="true">⌕</span><input value={filters.search} onChange={e => updateFilter('search', e.target.value)} placeholder="Поиск по № или названию" aria-label="Поиск по номеру или названию" /></span></label>
       <MultiSelect label="Проекты" options={catalog?.projects ?? []} selected={filters.projects} onChange={v => updateFilter('projects', v)} searchable allLabel="Все доступные проекты" />
       <StatusSelect statuses={catalog?.statuses ?? []} value={filters.statuses} onChange={v => updateFilter('statuses', v)} />
       <MultiSelect label="Типы" options={catalog?.trackers ?? []} selected={filters.trackers} onChange={v => updateFilter('trackers', v)} />
       <MultiSelect label="Приоритеты" options={catalog?.priorities ?? []} selected={filters.priorities} onChange={v => updateFilter('priorities', v)} />
       <MultiSelect label="Категории" options={(catalog?.categories ?? []).map(category => ({ ...category, name: `${category.name} · ${catalog?.projects.find(project => project.id === category.projectId)?.name ?? `#${category.projectId}`}` }))} selected={filters.categories} onChange={v => updateFilter('categories', v)} />
       <label className="rm-select-label"><span>Сортировка</span><select value={filters.sort} onChange={e => updateFilter('sort', e.target.value as Filters['sort'])}>{SORTS.map(([value, text]) => <option key={value} value={value}>{text}</option>)}</select></label>
-      <button className="rm-reset" onClick={() => setFilters({ ...DEFAULT_FILTERS })}>Сбросить</button>
+      <button className="rm-reset" onClick={() => setFilters({ ...DEFAULT_FILTERS })}><span aria-hidden="true">↺</span>Сбросить</button>
     </section>
-    <div className="rm-list-heading"><div><strong>Задачи</strong><span>{busy ? 'Загрузка…' : result ? `${result.total} найдено` : ''}</span></div><label>Шаблон запуска <select aria-label="Шаблон запуска" value={launchTemplateId || remote?.settings.defaultTemplateId || ''} onChange={e => setLaunchTemplateId(e.target.value)} disabled={!remote?.settings.templates.length}>{remote?.settings.templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label><label>На странице <select value={filters.pageSize} onChange={e => updateFilter('pageSize', Number(e.target.value))}><option>25</option><option>50</option><option>100</option></select></label></div>
+    <div className="rm-template-picker-row"><label>Шаблон запуска <select aria-label="Шаблон запуска" value={launchTemplateId || remote?.settings.defaultTemplateId || ''} onChange={e => setLaunchTemplateId(e.target.value)} disabled={!remote?.settings.templates.length}>{remote?.settings.templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label></div>
+    <div className="rm-list-heading"><div><strong>Задачи</strong><span>{busy ? 'Загрузка…' : result ? `${result.total} найдено` : ''}</span></div><label>На странице <select value={filters.pageSize} onChange={e => updateFilter('pageSize', Number(e.target.value))}><option>25</option><option>50</option><option>100</option></select></label></div>
     {busy && !result && <div className="rm-skeleton" aria-label="Загружаются задачи"><i/><i/><i/></div>}
     {!busy && result && !result.rows.length && <div className="rm-empty"><span aria-hidden="true">⌕</span><strong>Задачи не найдены</strong><p>Измените фильтры или обновите список.</p><button className="rm-secondary" onClick={() => setFilters({ ...DEFAULT_FILTERS })}>Сбросить фильтры</button></div>}
     {result && <div className={busy || error ? 'rm-issue-list rm-stale' : 'rm-issue-list'} aria-busy={busy}>
@@ -332,6 +418,11 @@ export function RedminePanel({ api }: PanelProps) {
       {result.rows.map(row => <IssueCard key={row.issue.id} row={row} busy={launchBusy === row.issue.id} globalLaunchBusy={launchBusy !== null} canLaunch={!!row.workspace?.available} onWorkspace={() => void openWorkspace(row.issue)} onLaunch={operationId => void launch(row, operationId)} onOpenSession={openSession} />)}
     </div>}
     {result && <nav className="rm-pagination" aria-label="Страницы задач"><span>Страница {filters.page} из {pages}</span><div><button className="rm-secondary" disabled={filters.page <= 1 || busy} onClick={() => updateFilter('page', filters.page - 1, false)}>Назад</button><button className="rm-secondary" disabled={filters.page >= pages || busy} onClick={() => updateFilter('page', filters.page + 1, false)}>Далее</button></div></nav>}
+    {launchConfirmation && <dialog ref={launchConfirmationDialog} className="rm-dialog" aria-modal="true" aria-labelledby="launch-confirm-title" onCancel={event => { event.preventDefault(); cancelLaunchConfirmation(); }}><div className="rm-dialog-card"><div className="rm-dialog-header"><div><h2 id="launch-confirm-title">У этой задачи уже есть сессии</h2><p>Задача #{launchConfirmation.row.issue.id}</p></div><button className="rm-icon-button" type="button" onClick={cancelLaunchConfirmation} aria-label="Закрыть" disabled={launchConfirmationBusy}>×</button></div>
+      <p className="rm-dialog-hint">Откройте существующую сессию или создайте новую:</p>
+      <ul className="rm-session-confirm-list">{launchConfirmation.sessions.map(item => <li key={item.sessionId}><button className="rm-link-button rm-session-confirm-link" type="button" onClick={() => openExistingSession(item)} disabled={launchConfirmationBusy}>Открыть сессию · {fmtDate(item.createdAt)}</button></li>)}</ul>
+      <div className="rm-dialog-actions"><button className="rm-secondary" type="button" onClick={cancelLaunchConfirmation} disabled={launchConfirmationBusy}>Отмена</button><button className="rm-primary" type="button" onClick={() => void confirmNewSession()} disabled={launchConfirmationBusy}>{launchConfirmationBusy ? 'Создание сессии…' : 'Создать новую сессию'}</button></div>
+    </div></dialog>}
     {workspaceIssue && <dialog ref={workspaceDialog} className="rm-dialog" aria-modal="true" aria-labelledby="workspace-title" onCancel={e => { e.preventDefault(); setWorkspaceIssue(undefined); }}><div className="rm-dialog-card"><div className="rm-dialog-header"><div><h2 id="workspace-title">Выбрать workspace</h2><p>Задача #{workspaceIssue.id} · {workspaceIssue.project.name}</p></div><button className="rm-icon-button" onClick={() => setWorkspaceIssue(undefined)} aria-label="Закрыть">×</button></div>
       {error && <div className="rm-error" role="alert">{error}</div>}
       <label className="rm-select-label"><span>Проект DSH</span><select value={workspaceChoice} onChange={e => { setWorkspaceChoice(e.target.value); setManualPath(''); }}><option value="">Выберите зарегистрированный workspace</option>{workspaces.map(w => <option key={w.id} value={w.id} disabled={!w.available}>{w.name} — {w.path}{w.available ? '' : ' (недоступен)'}</option>)}</select></label>
@@ -347,7 +438,7 @@ export function RedminePanel({ api }: PanelProps) {
 function IssueCard({ row, busy, globalLaunchBusy, canLaunch, onWorkspace, onLaunch, onOpenSession }: { row: Row; busy: boolean; globalLaunchBusy: boolean; canLaunch: boolean; onWorkspace: () => void; onLaunch: (operationId?: string) => void; onOpenSession: (launch: Launch) => unknown }) {
   const { issue } = row;
   const issueUrl = safeIssueUrl(issue.url);
-  return <article className="rm-issue-card"><div className="rm-issue-main">{issueUrl ? <a className="rm-issue-id" href={issueUrl} target="_blank" rel="noreferrer" title={`Открыть задачу #${issue.id} в Redmine`}>#{issue.id}</a> : <span className="rm-issue-id">#{issue.id}</span>}<h2 title={issue.subject}>{issue.subject}</h2></div>
+  return <article className="rm-issue-card"><div className="rm-issue-main"><h2 title={issue.subject}>{issueUrl ? <a className="rm-issue-id" href={issueUrl} target="_blank" rel="noreferrer" title={`Открыть задачу #${issue.id} в Redmine`}>#{issue.id}</a> : <span className="rm-issue-id">#{issue.id}</span>}<strong className="rm-issue-separator">: </strong>{issue.subject}</h2></div>
     <div className="rm-issue-meta">
       <span className={`rm-status ${statusTone(issue.status.closed)}`}>{issue.status.name}</span>
       {issue.tracker && <span>{issue.tracker.name}</span>}{issue.priority && <span>{issue.priority.name}</span>}

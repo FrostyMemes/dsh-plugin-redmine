@@ -16,6 +16,15 @@ export interface HostServices {
 }
 
 export function createDshAdapter(services: HostServices): DshAdapter {
+  async function existingSessions(sessionIds: string[]) {
+    const archived = new Set(services.workspaceRegistry.archivedSessionIds);
+    const requested = [...new Set(sessionIds)].filter(id => id && !archived.has(id));
+    if (!requested.length) return [];
+    const requestedSet = new Set(requested);
+    const listed = await services.sessionController.list({}, new AbortController().signal);
+    const available = new Set(listed.items.map(item => item.sessionId));
+    return requested.filter(id => requestedSet.has(id) && available.has(id));
+  }
   async function view(entity: Entity): Promise<Workspace> {
     let available = false;
     try { available = (await stat(entity.path)).isDirectory(); if (available) await access(entity.path, constants.R_OK | constants.X_OK); } catch { available = false; }
@@ -47,8 +56,8 @@ export function createDshAdapter(services: HostServices): DshAdapter {
     async sendPrompt(sessionId, requestId, text) { await services.sessionController.prompt({ sessionId, requestId, mode: 'followup', content: [{ type: 'text', text }] }, new AbortController().signal); },
     async renameSession(sessionId, title) { await services.sessionController.rename({ sessionId, title }); },
     async sessionExists(sessionId) {
-      if (services.workspaceRegistry.archivedSessionIds.includes(sessionId)) return false;
-      return (await services.sessionController.list({}, new AbortController().signal)).items.some(item => item.sessionId === sessionId);
+      return (await existingSessions([sessionId])).includes(sessionId);
     },
+    existingSessions,
   };
 }

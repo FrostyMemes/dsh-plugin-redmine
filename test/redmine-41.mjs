@@ -48,6 +48,7 @@ const makeHarness = (fetch) => {
     async list() { return []; }, async register() { throw new Error('unused'); }, async validate() { throw new Error('unused'); },
     async createSession() { throw new Error('unused'); }, async sendPrompt() { throw new Error('unused'); },
     async renameSession() { throw new Error('unused'); }, async sessionExists() { return false; },
+    async existingSessions() { return []; },
   };
   return { db, async service() { return PluginService.create({ store: db, credentials, dsh, logDirectory: 'unused', fetch }); } };
 };
