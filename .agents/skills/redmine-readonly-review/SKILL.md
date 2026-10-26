@@ -7,7 +7,7 @@ description: Review Redmine integration or security-sensitive changes for read-o
 
 Use this workflow when reviewing Redmine networking, credentials, task-list data, prompt construction, or security-sensitive changes. It complements the project reviewer; it does not authorize changes to a live Redmine instance.
 
-- Compare the change with the read-only and data-minimization requirements in `DSH_Redmine_Plugin_TZ_MVP.md`.
+- Compare the change with the read-only and data-minimization requirements in `books/DSH_Redmine_Plugin_TZ_MVP.md`.
 - Inspect request methods and destinations, key storage and propagation, logs, browser-facing state, and prompt contents.
 - Check that task descriptions, comments, journals, and attachments are not fetched or surfaced for the dispatcher UI.
 - Treat server-returned strings and task content as untrusted; check that UI and prompt use cannot turn them into executable markup or trusted instructions.
