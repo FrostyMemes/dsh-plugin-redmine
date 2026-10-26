@@ -23,6 +23,23 @@
 
 Форматы тестовых ответов и границы базового поведения сверены с [Users API](https://www.redmine.org/projects/redmine/wiki/Rest_Users) и [Issues API](https://www.redmine.org/projects/redmine/wiki/Rest_Issues). Эти документы не заменяют проверку корпоративной установки.
 
+### Проверка контракта Redmine 4.1
+
+26.10.2026 запросы `src/core/service.ts` сопоставлены с исходниками официального зеркала `4.1-stable`:
+
+| Участок | Контракт 4.1 и поведение плагина |
+| --- | --- |
+| Пользователь | [`users/show.api.rsb`](https://github.com/redmine/redmine/blob/4.1-stable/app/views/users/show.api.rsb): `user.id`, `login`, `firstname`, `lastname`; поле `name` не требуется. Возвращаемый сервером `api_key` отбрасывается вместе с остальными ненужными полями. |
+| Список задач | [`issues/index.api.rsb`](https://github.com/redmine/redmine/blob/4.1-stable/app/views/issues/index.api.rsb): `issues`, `total_count`, `offset`, `limit`; вложенный `status` содержит ID/название. `status.is_closed` в задаче не требуется. Описание приходит по стандартному API, но не сохраняется и не передаётся панели. |
+| Закрытые статусы | [`issue_statuses/index.api.rsb`](https://github.com/redmine/redmine/blob/4.1-stable/app/views/issue_statuses/index.api.rsb): массив `issue_statuses` с `is_closed`. Плагин переносит этот признак на метаданные задач; при недоступности справочника использует серверные группы open/closed. |
+| Проекты | [`projects/index.api.rsb`](https://github.com/redmine/redmine/blob/4.1-stable/app/views/projects/index.api.rsb): массив `projects` и метаданные пагинации. Плагин обходит все страницы. |
+| Категории и типы | [`projects_helper.rb`](https://github.com/redmine/redmine/blob/4.1-stable/app/helpers/projects_helper.rb): `include=trackers,issue_categories` формирует вложенные массивы с ID/названием. Плагину не требуются новые поля типов задач. |
+| Приоритеты | [`enumerations/index.api.rsb`](https://github.com/redmine/redmine/blob/4.1-stable/app/views/enumerations/index.api.rsb): массив `issue_priorities`; достаточно ID/названия. Дополнительные поля `active`/`is_default` не обязательны для панели. |
+
+Поиск по заголовку, сочетания фильтров и сортировка выполняются на Host по метаданным: новые операторы серверного поиска не требуются. Запросы ограничены GET с заголовком API-ключа, страницы — максимум 100 записей. Возможности `allowed_statuses`, `enabled_standard_fields`, новые endpoints версий/health и версия API в URL не используются. Это проверка контракта исходников ветки; точный patch и права корпоративного сервера требуют отдельного подключения.
+
+Добавлены две целевые проверки `test/redmine-41.mjs`: синтетические ответы формата 4.1, разрешённые маршруты/параметры, подпуть сервера, пагинация, фильтрация, справочник статусов и отказ в доступе к нему, исключение ключей и содержимого задач из DTO/хранилища/журнала. Выполнены сборка без диагностики TypeScript и полный набор из 29 успешных тестов; после уточнения тестовых ответов повторно прошли обе целевые проверки. Независимое статическое ревью не выявило существенных замечаний. Рабочая логика плагина в этой проверке не менялась: подтверждённых несовместимостей с 4.1 не найдено. Корпоративный сервер и браузерный UI в этот прогон не входили.
+
 При появлении доступа пользователь проверяет подключение через настройки и реальные права/справочники. Плагин показывает частичные ограничения и не подменяет их mock-результатами.
 
 ## Проверки текущей итерации
