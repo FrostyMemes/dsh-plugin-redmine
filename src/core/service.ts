@@ -3,6 +3,7 @@ import type { Action, Catalog, Category, Commands, CredentialStore, DshAdapter, 
 
 export interface ServiceOptions { store: Store; credentials: CredentialStore; dsh: DshAdapter; logDirectory: string; fetch?: typeof globalThis.fetch }
 interface RequestContext { base: string; key: string; generation: number; signal: AbortSignal }
+interface LaunchPromptSnapshot { templateId: string; text: string }
 const defaults: Settings = { mockEnabled: true, developerMode: false, openCreatedSession: true, launchInPlanMode: false, baseUrl: '', keyConfigured: false, templates: [{ id: 'default', name: 'Изучить задачу', text: 'Изучи задачу Redmine {{issue.url}} (№ {{issue.id}}, проект {{project.name}}). Используй уже доступные тебе Redmine MCP и соответствующий skill, чтобы самостоятельно получить описание и необходимые связанные сведения. Изучи требования в контексте текущего рабочего каталога DSH. Составь краткий анализ и план решения, обозначь неясности и риски. Не изменяй Redmine. Не приступай к изменению кода, пока пользователь не подтвердит план.' }], defaultTemplateId: 'default', mockScenario: 'normal' };
 const now = () => new Date().toISOString();
 const id = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -45,7 +46,7 @@ export class PluginService {
   private busy = new Map<string, Promise<Launch>>();
   private generation = 0;
   private contextGeneration = 0;
-  private confirmationTokens = new Map<string, { issueId: number; generation: number; contextGeneration: number; scope: string; expiresAt: number }>();
+  private confirmationTokens = new Map<string, { issueId: number; generation: number; contextGeneration: number; scope: string; sessionIds: string[]; expiresAt: number }>();
   private controller = new AbortController();
   private logChain: Promise<void> = Promise.resolve();
   private listQueue: Promise<void> = Promise.resolve();
@@ -91,6 +92,7 @@ export class PluginService {
       case 'state': return this.state() as any;
       case 'configure': return await this.configure(x) as any;
       case 'check': return await this.check() as any;
+      case 'clearHealth': return await this.clearHealth() as any;
       case 'list': return await this.list(x) as any;
       case 'workspaces': return await this.o.dsh.list() as any;
       case 'selectWorkspace': return await this.selectWorkspace(x) as any;
@@ -178,6 +180,7 @@ export class PluginService {
     this.assertGeneration(generation);
     this.health = { status: steps.some(x => x.status === 'error') ? 'error' : steps.some(x => x.status === 'warning') ? 'warning' : 'ok', checkedAt: now(), mock: false, stale: false, ...(user ? { user } : {}), steps }; await this.persistHealth(); await this.log(this.health.status === 'ok' ? 'info' : 'warning', 'healthcheck', 'Connection check finished', { status: this.health.status }); return this.health;
   }
+  private async clearHealth(): Promise<State> { await this.o.store.set('redmine.health', undefined); this.health = undefined; return this.state(); }
   private async persistHealth() { await this.o.store.set('redmine.health', this.health); }
   private base() { if (!this.settings.baseUrl) throw new Error('Redmine URL is not configured'); return normUrl(this.settings.baseUrl); }
   private async getJson(path: string, ctx: RequestContext): Promise<any> {
@@ -359,25 +362,25 @@ export class PluginService {
       const previous = latestBySession.get(launch.sessionId);
       if (!previous || launch.createdAt > previous.createdAt) latestBySession.set(launch.sessionId, launch);
     }
-    const sessions = [...latestBySession.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const sessions = [...latestBySession.values()].filter(item => !item.planModePresetMismatch).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     const timestamp = Date.now();
     for (const [token, record] of this.confirmationTokens) if (record.expiresAt <= timestamp) this.confirmationTokens.delete(token);
     const confirmationToken = id();
-    this.confirmationTokens.set(confirmationToken, { issueId, generation, contextGeneration, scope, expiresAt: timestamp + 2 * 60_000 });
+    this.confirmationTokens.set(confirmationToken, { issueId, generation, contextGeneration, scope, sessionIds: sessions.map(session => session.sessionId), expiresAt: timestamp + 2 * 60_000 });
     return { sessions, confirmationToken };
   }
   private assertContextGeneration(contextGeneration: number) {
     if (contextGeneration !== this.contextGeneration) throw new Error('Operation superseded by a context change');
   }
-  private validateConfirmationToken(token: string | undefined, issueId: number, generation: number, contextGeneration: number, scope: string) {
+  private validateConfirmationToken(token: string | undefined, issueId: number, generation: number, contextGeneration: number, scope: string, existingSessionId?: string) {
     const record = token ? this.confirmationTokens.get(token) : undefined;
-    if (!record || record.issueId !== issueId || record.generation !== generation || record.contextGeneration !== contextGeneration || contextGeneration !== this.contextGeneration || record.scope !== scope || record.expiresAt <= Date.now()) {
+    if (!record || record.issueId !== issueId || record.generation !== generation || record.contextGeneration !== contextGeneration || contextGeneration !== this.contextGeneration || record.scope !== scope || record.expiresAt <= Date.now() || (existingSessionId !== undefined && !record.sessionIds.includes(existingSessionId))) {
       if (token) this.confirmationTokens.delete(token);
       throw new Error('Launch confirmation is stale or expired; check existing sessions again');
     }
   }
-  private consumeConfirmationToken(token: string | undefined, issueId: number, generation: number, contextGeneration: number, scope: string) {
-    this.validateConfirmationToken(token, issueId, generation, contextGeneration, scope);
+  private consumeConfirmationToken(token: string | undefined, issueId: number, generation: number, contextGeneration: number, scope: string, existingSessionId?: string) {
+    this.validateConfirmationToken(token, issueId, generation, contextGeneration, scope, existingSessionId);
     this.confirmationTokens.delete(token!);
   }
   private async selectWorkspace(input: Commands['selectWorkspace']['input']): Promise<Workspace> {
@@ -407,34 +410,89 @@ export class PluginService {
     await this.configuring; const generation = this.generation, contextGeneration = this.contextGeneration, scope = this.ns;
     if (!input.operationId || input.operationId.length > 120) throw new Error('Invalid operation ID');
     const storageKey = `redmine.scope.${scope}.launch.${input.operationId}`;
+    const promptStorageKey = `redmine.scope.${scope}.launchPrompt.${input.operationId}`;
     let launch = await this.o.store.get<Launch | undefined>(storageKey, undefined); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
-    if (!launch) this.validateConfirmationToken(input.confirmationToken, input.issueId, generation, contextGeneration, scope);
+    let promptSnapshot = await this.o.store.get<LaunchPromptSnapshot | undefined>(promptStorageKey, undefined); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    if (!launch) this.validateConfirmationToken(input.confirmationToken, input.issueId, generation, contextGeneration, scope, input.existingSessionId);
     const issue = this.data?.rows.find(r => r.issue.id === input.issueId)?.issue; if (!issue) throw new Error('Issue metadata is not loaded');
     if (launch && launch.issueId !== issue.id) throw new Error('Operation ID is already bound to a different launch');
-    if (launch?.status === 'sent') return launch;
-    const mockMode = this.settings.mockEnabled, template = this.settings.templates.find(x => x.id === (input.templateId ?? this.settings.defaultTemplateId)) ?? this.settings.templates.find(x => x.id === this.settings.defaultTemplateId);
-    if (!template) throw new Error('Template not found');
-    const projectMap = await this.o.store.get<Record<string, string>>(`redmine.scope.${scope}.projectWorkspaces`, {}); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
-    const issueMap = await this.o.store.get<Record<string, string>>(`redmine.scope.${scope}.issueWorkspaces`, {}); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
-    const workspaceId = issueMap[String(issue.id)] ?? projectMap[String(issue.project.id)]; if (!workspaceId) throw new Error('Select a workspace before starting a task');
-    const workspace = await this.o.dsh.validate(workspaceId); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    if (launch && input.existingSessionId && (!launch.reusedSession || launch.sessionId !== input.existingSessionId)) throw new Error('Operation ID is already bound to a different session');
+    if (launch?.status === 'sent') {
+      await this.o.store.set(promptStorageKey, undefined).catch(() => undefined);
+      this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      return launch;
+    }
+    if (launch?.retryBlocked) return launch;
+    if (launch && !promptSnapshot && launch.promptSnapshotVersion !== 1 && (launch.status === 'failed' || launch.status === 'sending') && !launch.planModePresetMismatch) {
+      launch = { ...launch, status: 'failed', retryBlocked: true, error: 'Нельзя безопасно повторить старую операцию: исходный текст промпта не сохранён. Нажмите «В работу», чтобы запустить новую операцию.' };
+      await this.o.store.set(storageKey, launch); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      await this.recordLaunch(launch, scope); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      if (this.data) this.data.rows = this.data.rows.map(row => row.issue.id === issue.id ? { ...row, launches: [...row.launches.filter(item => item.operationId !== launch!.operationId), launch!] } : row);
+      await this.log('warning', 'launch', 'Legacy launch retry blocked without prompt snapshot', { issueId: issue.id, sessionId: launch.sessionId, requestId: launch.requestId });
+      this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      return launch;
+    }
+    const mockMode = this.settings.mockEnabled, templateId = launch?.templateId ?? promptSnapshot?.templateId ?? input.templateId ?? this.settings.defaultTemplateId;
+    const template = this.settings.templates.find(x => x.id === templateId);
+    if (!promptSnapshot && !template) throw new Error(launch?.templateId ? 'Шаблон исходной операции больше недоступен. Выберите шаблон и начните новую отправку.' : 'Template not found');
+    let workspace: Workspace;
+    if (launch?.reusedSession) {
+      workspace = await this.o.dsh.validate(launch.workspaceId); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    } else if (input.existingSessionId) {
+      const recorded = await this.o.store.get<Launch[]>(`redmine.scope.${scope}.issueLaunches.${issue.id}`, []); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      const sourceLaunch = recorded.filter(item => item.issueId === issue.id && item.sessionId === input.existingSessionId).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+      if (!sourceLaunch || sourceLaunch.planModePresetMismatch) throw new Error('Selected session is no longer available for this task');
+      workspace = await this.o.dsh.validate(sourceLaunch.workspaceId); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      if (!(await this.o.dsh.sessionExists(input.existingSessionId))) throw new Error('Selected session is no longer available');
+      this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      this.consumeConfirmationToken(input.confirmationToken, issue.id, generation, contextGeneration, scope, input.existingSessionId);
+      launch = { operationId: input.operationId, issueId: issue.id, workspaceId: sourceLaunch.workspaceId, sessionId: input.existingSessionId, requestId: input.operationId, templateId, promptSnapshotVersion: 1, titleApplied: true, reusedSession: true, sessionCreatedAt: sourceLaunch.sessionCreatedAt ?? sourceLaunch.createdAt, status: 'sending', createdAt: now() };
+      await this.o.store.set(storageKey, launch); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration); await this.recordLaunch(launch, scope); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    } else {
+      const projectMap = await this.o.store.get<Record<string, string>>(`redmine.scope.${scope}.projectWorkspaces`, {}); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      const issueMap = await this.o.store.get<Record<string, string>>(`redmine.scope.${scope}.issueWorkspaces`, {}); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      const workspaceId = issueMap[String(issue.id)] ?? projectMap[String(issue.project.id)]; if (!workspaceId) throw new Error('Select a workspace before starting a task');
+      workspace = await this.o.dsh.validate(workspaceId); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    }
     if (!launch) {
       const planModeOnLaunch = this.settings.launchInPlanMode;
       const agentPreset = planModeOnLaunch ? await this.o.dsh.planModePreset() : undefined;
       this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
       this.consumeConfirmationToken(input.confirmationToken, issue.id, generation, contextGeneration, scope);
-      launch = { operationId: input.operationId, issueId: issue.id, workspaceId: workspace.id, sessionId: `redmine-${input.operationId}`, requestId: input.operationId, sessionTitle: issue.subject, planModeOnLaunch, ...(agentPreset ? { agentPreset } : {}), status: 'creating', createdAt: now() };
+      launch = { operationId: input.operationId, issueId: issue.id, workspaceId: workspace.id, sessionId: `redmine-${input.operationId}`, requestId: input.operationId, sessionTitle: issue.subject, templateId, promptSnapshotVersion: 1, planModeOnLaunch, ...(agentPreset ? { agentPreset } : {}), status: 'creating', createdAt: now() };
       await this.o.store.set(storageKey, launch); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration); await this.recordLaunch(launch, scope); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
     }
-    else if (launch.issueId !== issue.id || launch.workspaceId !== workspace.id) throw new Error('Operation ID is already bound to a different launch');
+    else if (launch.issueId !== issue.id || (!launch.reusedSession && launch.workspaceId !== workspace.id)) throw new Error('Operation ID is already bound to a different launch');
     else launch = { ...launch, sessionTitle: launch.sessionTitle ?? issue.subject };
     try {
+      if (!promptSnapshot) {
+        if (!template) throw new Error('Шаблон исходной операции больше недоступен. Выберите шаблон и начните новую отправку.');
+        const quote = (value: string) => JSON.stringify(value);
+        const promptBody = template.text.replace(/{{\s*([^}]+?)\s*}}/g, (_match, key: string) => {
+          const values: Record<string, string> = { 'issue.id': String(issue.id), 'issue.url': quote(issue.url), 'issue.subject': quote(issue.subject), 'project.id': String(issue.project.id), 'project.name': quote(issue.project.name), status: quote(issue.status.name), tracker: quote(issue.tracker?.name ?? ''), priority: quote(issue.priority?.name ?? ''), 'workspace.path': quote(workspace.path) }; return values[key] ?? '';
+        });
+        promptSnapshot = { templateId, text: mockMode
+          ? 'Это демонстрационный запуск. Не вызывай Redmine, MCP или сеть, не изменяй файлы. Объясни, что для реальной работы нужно отключить демонстрационный режим и выбрать задачу в Redmine.'
+          : promptBody };
+        await this.o.store.set(promptStorageKey, promptSnapshot); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      }
+      let reusedSessionChecked = false;
       if (launch.status === 'failed') {
         if (launch.planModePresetMismatch) throw Object.assign(new Error('DSH создал сессию с другим preset. Эта операция остановлена без промпта; исправьте preset и запустите задачу заново.'), { sessionId: launch.sessionId, planModePresetMismatch: true });
-        const exists = await this.o.dsh.sessionExists(launch.sessionId); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
-        launch = { ...launch, status: exists ? 'sending' : 'creating', titleApplied: exists ? launch.titleApplied : false, error: undefined };
+        if (launch.reusedSession) {
+          reusedSessionChecked = await this.o.dsh.sessionExists(launch.sessionId); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+          if (!reusedSessionChecked) throw new Error('Существующая сессия больше недоступна. Новая сессия не создавалась.');
+          launch = { ...launch, status: 'sending', error: undefined };
+        } else {
+          const exists = await this.o.dsh.sessionExists(launch.sessionId); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+          launch = { ...launch, status: exists ? 'sending' : 'creating', titleApplied: exists ? launch.titleApplied : false, error: undefined };
+        }
       }
-      if (launch.status === 'creating') {
+      if (launch.reusedSession && !reusedSessionChecked) {
+        reusedSessionChecked = await this.o.dsh.sessionExists(launch.sessionId); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+        if (!reusedSessionChecked) throw new Error('Существующая сессия больше недоступна. Новая сессия не создавалась.');
+      }
+      if (!launch.reusedSession && launch.status === 'creating') {
         const createdId = await this.o.dsh.createSession(launch.workspaceId, launch.sessionId, launch.planModeOnLaunch ? launch.agentPreset : undefined);
         if (createdId) launch = { ...launch, sessionId: createdId };
         this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
@@ -444,29 +502,24 @@ export class PluginService {
         await this.o.dsh.enablePlanMode(launch.sessionId);
         this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
       }
-      if (!launch.titleApplied) {
+      if (!launch.reusedSession && !launch.titleApplied) {
         await this.o.dsh.renameSession(launch.sessionId, launch.sessionTitle ?? issue.subject);
         this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
         launch = { ...launch, sessionTitle: launch.sessionTitle ?? issue.subject, titleApplied: true };
         await this.o.store.set(storageKey, launch); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration); await this.recordLaunch(launch, scope); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
       }
-      const quote = (v: string) => JSON.stringify(v);
-      const promptBody = template.text.replace(/{{\s*([^}]+?)\s*}}/g, (_m, k: string) => {
-        const values: Record<string, string> = { 'issue.id': String(issue.id), 'issue.url': quote(issue.url), 'issue.subject': quote(issue.subject), 'project.id': String(issue.project.id), 'project.name': quote(issue.project.name), status: quote(issue.status.name), tracker: quote(issue.tracker?.name ?? ''), priority: quote(issue.priority?.name ?? ''), 'workspace.path': quote(workspace.path) }; return values[k] ?? '';
-      });
-      const prompt = mockMode
-        ? 'Это демонстрационный запуск. Не вызывай Redmine, MCP или сеть, не изменяй файлы. Объясни, что для реальной работы нужно отключить демонстрационный режим и выбрать задачу в Redmine.'
-        : promptBody;
-      await this.o.dsh.sendPrompt(launch.sessionId, launch.requestId, prompt);
+      await this.o.dsh.sendPrompt(launch.sessionId, launch.requestId, promptSnapshot.text);
       this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
       launch = { ...launch, status: 'sent' }; await this.o.store.set(storageKey, launch); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
       await this.recordLaunch(launch, scope); this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
       this.data!.rows = this.data!.rows.map(r => r.issue.id === issue.id ? { ...r, launches: [...r.launches.filter(x => x.operationId !== launch!.operationId), launch!] } : r);
+      await this.o.store.set(promptStorageKey, undefined).catch(() => undefined);
       await this.log('info', 'launch', 'Task session started', { issueId: issue.id, workspaceId: workspace.id, sessionId: launch.sessionId, requestId: launch.requestId }); return launch;
     } catch (e) {
       const remoteSessionId = (e as any)?.sessionId ?? (e as any)?.data?.sessionId ?? (e as any)?.data?.session?.id;
       const errorText = this.safeText(e);
       const planModePresetMismatch = (e as any)?.planModePresetMismatch === true || launch.planModePresetMismatch === true;
+      if (planModePresetMismatch) await this.o.store.set(promptStorageKey, undefined).catch(() => undefined);
       launch = { ...launch, ...(typeof remoteSessionId === 'string' ? { sessionId: remoteSessionId } : {}), ...(planModePresetMismatch ? { planModePresetMismatch: true } : {}), status: 'failed', error: errorText }; await this.o.store.set(storageKey, launch);
       await this.recordLaunch(launch, scope);
       await this.log('error', 'launch', 'Task session launch failed', { issueId: issue.id, sessionId: launch.sessionId, requestId: launch.requestId, message: errorText }); throw Object.assign(new Error(errorText), { sessionId: launch.sessionId });
@@ -477,7 +530,7 @@ export class PluginService {
     const rows = await this.o.store.get<Launch[]>(key, []); const updated = [...rows.filter(x => x.operationId !== launch.operationId), launch]; await this.o.store.set(key, updated);
   }
   private async clientEvent(input: Commands['clientEvent']['input']) {
-    const allowed = new Set(['state', 'configure', 'check', 'list', 'refresh', 'workspaces', 'selectWorkspace', 'launch', 'openSession', 'sessionAvailable', 'issueSessions', 'filter', 'search', 'sort', 'page']);
+    const allowed = new Set(['state', 'configure', 'check', 'clearHealth', 'list', 'refresh', 'workspaces', 'selectWorkspace', 'launch', 'openSession', 'sessionAvailable', 'issueSessions', 'filter', 'search', 'sort', 'page']);
     if (!allowed.has(input.operation)) return { accepted: false };
     await this.log(input.level, 'client', 'Client event', { operation: input.operation }); return { accepted: true };
   }

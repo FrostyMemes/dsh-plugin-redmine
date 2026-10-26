@@ -131,6 +131,8 @@
 .rm-template-help-tooltip { overflow-y: auto; padding: 12px 14px; border: 1px solid var(--rm-border); border-radius: 9px; background: var(--rm-surface-raised); color: var(--rm-text); box-shadow: 0 12px 32px #0007; font-size: 12px; line-height: 1.45; }
 .rm-template-help-tooltip dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: baseline; gap: 7px 12px; margin: 0; }
 .rm-template-help-tooltip dt code { color: var(--rm-accent); white-space: nowrap; }
+.rm-template-variable { padding: 0; border: 0; background: transparent; color: var(--rm-accent); font: inherit; cursor: pointer; }
+.rm-template-variable:hover, .rm-template-variable:focus-visible { text-decoration: underline; text-underline-offset: 2px; }
 .rm-template-help-tooltip dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .rm-template-title > .rm-field { margin-bottom: 0; }

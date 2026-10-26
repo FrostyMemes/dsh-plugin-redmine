@@ -11,7 +11,7 @@ export interface Filters { projects: number[]; statuses: string[]; trackers: num
 export interface Catalog { projects: Named[]; statuses: (Named & { closed?: boolean })[]; trackers: Named[]; priorities: Named[]; categories: Category[]; warnings: string[] }
 export interface HealthStep { name: string; status: 'ok' | 'warning' | 'error' | 'skipped'; message: string; httpStatus?: number }
 export interface Health { status: 'ok' | 'warning' | 'error'; checkedAt: string; mock: boolean; stale: boolean; user?: Named; steps: HealthStep[] }
-export interface Launch { operationId: string; issueId: number; workspaceId: string; sessionId: string; requestId: string; sessionTitle?: string; titleApplied?: boolean; planModeOnLaunch?: boolean; agentPreset?: string; planModePresetMismatch?: boolean; status: 'creating' | 'sending' | 'sent' | 'failed'; createdAt: string; error?: string }
+export interface Launch { operationId: string; issueId: number; workspaceId: string; sessionId: string; requestId: string; sessionTitle?: string; templateId?: string; promptSnapshotVersion?: number; titleApplied?: boolean; reusedSession?: boolean; sessionCreatedAt?: string; planModeOnLaunch?: boolean; agentPreset?: string; planModePresetMismatch?: boolean; retryBlocked?: boolean; status: 'creating' | 'sending' | 'sent' | 'failed'; createdAt: string; error?: string }
 export interface Row { issue: Issue; workspace?: Workspace; launches: Launch[] }
 export interface ListResult { rows: Row[]; total: number; catalog: Catalog; filters: Filters; fetchedAt: string; incomplete: boolean; user: Named; contextGeneration: number }
 export interface LogEntry { id: string; time: string; level: Level; component: string; operation: string; message: string; fields: Record<string, string | number | boolean | null> }
@@ -20,10 +20,11 @@ export interface Commands {
   state: { input: {}; output: State };
   configure: { input: Partial<Omit<Settings, 'keyConfigured'>> & { apiKey?: string; clearKey?: boolean }; output: State };
   check: { input: {}; output: Health };
+  clearHealth: { input: {}; output: State };
   list: { input: { filters?: Partial<Filters>; refresh?: boolean }; output: ListResult };
   workspaces: { input: {}; output: Workspace[] };
   selectWorkspace: { input: { issueId: number; workspaceId?: string; path?: string; rememberProject: boolean }; output: Workspace };
-  launch: { input: { issueId: number; operationId: string; templateId?: string; confirmationToken?: string }; output: Launch };
+  launch: { input: { issueId: number; operationId: string; templateId?: string; confirmationToken?: string; existingSessionId?: string }; output: Launch };
   logs: { input: { after?: string }; output: LogEntry[] };
   clientEvent: { input: { level: Level; operation: string }; output: { accepted: boolean } };
   runtimeError: { input: { origin: 'browser' | 'react'; message: string; errorName?: string; source?: string; line?: number; column?: number; stack?: string }; output: { accepted: boolean } };
