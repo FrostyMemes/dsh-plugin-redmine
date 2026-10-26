@@ -53,7 +53,13 @@ export class RedmineHost extends TypertRemoteService {
       set: async value => { await this.ctx.credentials.set(CREDENTIAL, value); },
       clear: async () => { await this.ctx.credentials.unset(CREDENTIAL); },
     };
-    this.service = await PluginService.create({ store, credentials: this.secrets, dsh: createDshAdapter(this.ctx as unknown as HostServices), logDirectory: '' });
+    const hostContext = this.ctx as unknown as HostServices & { get(name: string): unknown };
+    const dsh = createDshAdapter({
+      workspaceRegistry: hostContext.workspaceRegistry,
+      sessionController: hostContext.sessionController,
+      getAgentPresets: () => hostContext.get('agentPresets') as HostServices['agentPresets'],
+    });
+    this.service = await PluginService.create({ store, credentials: this.secrets, dsh, logDirectory: '' });
   }
   @Remote
   async invoke(request: unknown): Promise<any> {

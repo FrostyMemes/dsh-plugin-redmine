@@ -5,7 +5,8 @@ import { PluginService } from '../dist/core/service.js';
 const store = () => { const values = new Map(); return { values, async get(k, fallback) { return values.has(k) ? values.get(k) : fallback; }, async set(k,v) { values.set(k,v); } }; };
 const harness = (options = {}) => {
   const db = options.db ?? store(), sends = [], sessions = new Set(), calls = [], renames = [], creds = { key: undefined, async resolve(){ return this.key; }, async set(v){ this.key=v; }, async clear(){ this.key=undefined; } };
-  const dsh = { async list(){ return [{id:'w1',name:'Workspace',path:'C:/work',available:true}]; }, async register(path){ return {id:'w1',name:'Workspace',path,available:true}; }, async validate(id){ if(id!=='w1') throw Error('missing'); return {id:'w1',name:'Workspace',path:'C:/work',available:true}; }, async createSession(w,s){ calls.push(['create',w,s]); sessions.add(s); }, async sendPrompt(s,r,p){ calls.push(['send',s,r]); sends.push(p); }, async renameSession(s,t){ calls.push(['rename',s,t]); renames.push({sessionId:s,title:t}); }, async sessionExists(s){ return sessions.has(s); }, async existingSessions(ids){ calls.push(['existingSessions', [...ids]]); return [...new Set(ids)].filter(id=>sessions.has(id)); } };
+  let planModePresetFailures = options.planModePresetFailures ?? 0, planModeEnableFailures = options.planModeEnableFailures ?? 0;
+  const dsh = { async list(){ return [{id:'w1',name:'Workspace',path:'C:/work',available:true}]; }, async register(path){ return {id:'w1',name:'Workspace',path,available:true}; }, async validate(id){ if(id!=='w1') throw Error('missing'); return {id:'w1',name:'Workspace',path:'C:/work',available:true}; }, async createSession(w,s,preset){ calls.push(['create',w,s,preset]); sessions.add(s); }, async planModePreset(){ calls.push(['plan-preflight']); if(planModePresetFailures-->0) throw Error('Plan mode unavailable'); return options.agentPreset ?? 'default-preset'; }, async enablePlanMode(s){ calls.push(['plan-mode',s]); if(planModeEnableFailures-->0) throw Error('Plan mode set failed'); }, async sendPrompt(s,r,p){ calls.push(['send',s,r]); sends.push(p); }, async renameSession(s,t){ calls.push(['rename',s,t]); renames.push({sessionId:s,title:t}); }, async sessionExists(s){ return sessions.has(s); }, async existingSessions(ids){ calls.push(['existingSessions', [...ids]]); return [...new Set(ids)].filter(id=>sessions.has(id)); } };
   return { db, sends, sessions, calls, renames, creds, dsh, async service(opts={}) { return PluginService.create({store:db,credentials:creds,dsh,logDirectory:'unused',fetch:opts.fetch}); } };
 };
 const json = (obj, status=200) => new Response(JSON.stringify(obj), {status, headers:{'content-type':'application/json'}});
@@ -19,6 +20,14 @@ test('mock default makes no network requests and returns broad deterministic met
   const result=await s.call('list',{});
   assert.equal(count,0); assert.equal(result.catalog.projects.length,130); assert.ok(result.total>=120); assert.ok(result.rows.every(r=>!('description' in r.issue)));
   assert.equal(result.filters.statuses[0],'open'); assert.ok(result.catalog.categories.some(c=>c.name==='Общее'));
+});
+
+test('plan-mode launch preference defaults off and persists across Host service reload', async () => {
+  const h=harness(), first=await h.service();
+  assert.equal((await first.call('state',{})).settings.launchInPlanMode,false);
+  await first.call('configure',{launchInPlanMode:true});
+  const second=await h.service();
+  assert.equal((await second.call('state',{})).settings.launchInPlanMode,true);
 });
 
 test('real Redmine uses GET, API key header, paginates old REST responses, and excludes issue body', async () => {
@@ -141,6 +150,58 @@ test('launch retries reuse a session and request ID; duplicate operation is one 
   const op='stable-op'; await assert.rejects(launchFromPreflight(s,data.rows[0].issue.id,op,data.contextGeneration), e=>e.sessionId==='redmine-stable-op');
   const complete=await s.call('launch',{issueId:data.rows[0].issue.id,operationId:op}); const duplicate=await s.call('launch',{issueId:data.rows[0].issue.id,operationId:op});
   assert.equal(complete.sessionId,duplicate.sessionId); assert.equal(h.calls.filter(x=>x[0]==='create').length,1); assert.equal(h.calls.filter(x=>x[0]==='rename').length,1); assert.equal(h.calls.filter(x=>x[0]==='send').length,2); assert.deepEqual(h.calls.filter(x=>x[0]!=='existingSessions').map(x=>x[0]),['create','rename','send','send']); assert.equal(h.renames[0].title,data.rows[0].issue.subject); assert.equal(complete.sessionTitle,data.rows[0].issue.subject); assert.equal(complete.titleApplied,true); assert.match(h.sends[0],/демонстрационный запуск/i); assert.match(h.sends[0],/Не вызывай Redmine, MCP или сеть/i); assert.doesNotMatch(h.sends[0],/redmine\.invalid|10000/);
+});
+
+test('plan-mode launch snapshots the default preset and enables the mode before any prompt, including retry', async () => {
+  const h=harness({agentPreset:'planning'}), s=await h.service();
+  await s.call('configure',{launchInPlanMode:true});
+  const data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  h.dsh.enablePlanMode=async session=>{ h.calls.push(['plan-mode',session]); if(h.calls.filter(x=>x[0]==='plan-mode').length===1) throw Error('temporary plan service failure'); };
+  const operationId='plan-mode-retry';
+  await assert.rejects(launchFromPreflight(s,issueId,operationId,data.contextGeneration),/temporary plan service failure/);
+  const saved=h.db.values.get(`redmine.scope.mock:user:7.launch.${operationId}`);
+  assert.equal(saved.planModeOnLaunch,true); assert.equal(saved.agentPreset,'planning');
+  assert.equal(h.calls.filter(x=>x[0]==='send').length,0);
+  assert.deepEqual(h.calls.find(x=>x[0]==='create'),['create','w1',`redmine-${operationId}`,'planning']);
+  await s.call('configure',{launchInPlanMode:false});
+  const complete=await s.call('launch',{issueId,operationId});
+  const steps=h.calls.map(x=>x[0]);
+  assert.equal(complete.status,'sent'); assert.equal(complete.planModeOnLaunch,true);
+  assert.equal(steps.filter(x=>x==='create').length,1); assert.equal(steps.filter(x=>x==='plan-preflight').length,1);
+  assert.equal(steps.filter(x=>x==='plan-mode').length,2);
+  assert.ok(steps.lastIndexOf('plan-mode') < steps.indexOf('send'));
+});
+
+test('plan-mode preflight failure does not create a session or send a prompt', async () => {
+  const h=harness({planModePresetFailures:1}), s=await h.service();
+  await s.call('configure',{launchInPlanMode:true});
+  const data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  await assert.rejects(launchFromPreflight(s,issueId,'plan-mode-unavailable',data.contextGeneration),/Plan mode unavailable/);
+  assert.equal(h.calls.filter(x=>x[0]==='create').length,0);
+  assert.equal(h.sessions.size,0); assert.equal(h.calls.filter(x=>x[0]==='send').length,0);
+});
+
+test('preset mismatch stays blocked on same-operation retry even when plan mode is available', async () => {
+  const h=harness({agentPreset:'expected-preset'}), s=await h.service();
+  await s.call('configure',{launchInPlanMode:true});
+  const data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  let createCalls=0, planModeCalls=0;
+  h.dsh.createSession=async (_workspaceId,sessionId)=>{
+    createCalls++; h.sessions.add(sessionId);
+    throw Object.assign(new Error('wrong preset returned'),{sessionId,planModePresetMismatch:true});
+  };
+  h.dsh.enablePlanMode=async sessionId=>{ planModeCalls++; h.calls.push(['plan-mode',sessionId]); };
+  const operationId='preset-mismatch-retry';
+  await assert.rejects(launchFromPreflight(s,issueId,operationId,data.contextGeneration),/wrong preset returned/);
+  const saved=h.db.values.get(`redmine.scope.mock:user:7.launch.${operationId}`);
+  assert.equal(saved.planModePresetMismatch,true);
+  await assert.rejects(s.call('launch',{issueId,operationId}),/different preset|другим preset/i);
+  assert.equal(createCalls,1); assert.equal(planModeCalls,0);
+  assert.equal(h.calls.filter(call=>call[0]==='send').length,0);
+  assert.equal(h.sessions.has(`redmine-${operationId}`),true);
 });
 
 test('issue session preflight returns only live sessions recorded for that loaded issue in one batch', async () => {

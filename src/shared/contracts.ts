@@ -6,12 +6,12 @@ export interface Issue { id: number; subject: string; project: Named; status: Na
 export interface Workspace { id: string; name: string; path: string; available: boolean }
 export interface Template { id: string; name: string; text: string }
 export type MockScenario = 'normal' | 'slow' | 'empty' | 'load-error' | 'refresh-error' | 'forbidden';
-export interface Settings { mockEnabled: boolean; developerMode: boolean; openCreatedSession: boolean; baseUrl: string; keyConfigured: boolean; templates: Template[]; defaultTemplateId: string; mockScenario: MockScenario }
+export interface Settings { mockEnabled: boolean; developerMode: boolean; openCreatedSession: boolean; launchInPlanMode: boolean; baseUrl: string; keyConfigured: boolean; templates: Template[]; defaultTemplateId: string; mockScenario: MockScenario }
 export interface Filters { projects: number[]; statuses: string[]; trackers: number[]; priorities: number[]; categories: number[]; search: string; sort: 'updated-desc' | 'updated-asc' | 'id-desc' | 'subject-asc'; page: number; pageSize: number }
 export interface Catalog { projects: Named[]; statuses: (Named & { closed?: boolean })[]; trackers: Named[]; priorities: Named[]; categories: Category[]; warnings: string[] }
 export interface HealthStep { name: string; status: 'ok' | 'warning' | 'error' | 'skipped'; message: string; httpStatus?: number }
 export interface Health { status: 'ok' | 'warning' | 'error'; checkedAt: string; mock: boolean; stale: boolean; user?: Named; steps: HealthStep[] }
-export interface Launch { operationId: string; issueId: number; workspaceId: string; sessionId: string; requestId: string; sessionTitle?: string; titleApplied?: boolean; status: 'creating' | 'sending' | 'sent' | 'failed'; createdAt: string; error?: string }
+export interface Launch { operationId: string; issueId: number; workspaceId: string; sessionId: string; requestId: string; sessionTitle?: string; titleApplied?: boolean; planModeOnLaunch?: boolean; agentPreset?: string; planModePresetMismatch?: boolean; status: 'creating' | 'sending' | 'sent' | 'failed'; createdAt: string; error?: string }
 export interface Row { issue: Issue; workspace?: Workspace; launches: Launch[] }
 export interface ListResult { rows: Row[]; total: number; catalog: Catalog; filters: Filters; fetchedAt: string; incomplete: boolean; user: Named; contextGeneration: number }
 export interface LogEntry { id: string; time: string; level: Level; component: string; operation: string; message: string; fields: Record<string, string | number | boolean | null> }
@@ -41,7 +41,9 @@ export interface DshAdapter {
   list(): Promise<Workspace[]>;
   register(path: string): Promise<Workspace>;
   validate(id: string): Promise<Workspace>;
-  createSession(workspaceId: string, sessionId: string): Promise<string>;
+  createSession(workspaceId: string, sessionId: string, agentPreset?: string): Promise<string>;
+  planModePreset(): Promise<string>;
+  enablePlanMode(sessionId: string): Promise<void>;
   sendPrompt(sessionId: string, requestId: string, text: string): Promise<void>;
   renameSession(sessionId: string, title: string): Promise<void>;
   sessionExists(sessionId: string): Promise<boolean>;

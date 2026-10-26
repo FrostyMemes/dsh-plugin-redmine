@@ -6,7 +6,7 @@ const template = z.object({ id: identity, name: z.string().min(1).max(100), text
 const filters = z.object({ projects: ids, statuses: z.array(z.string().max(40)).max(100), trackers: ids, priorities: ids, categories: ids, search: z.string().max(300), sort: z.enum(['updated-desc','updated-asc','id-desc','subject-asc']), page: z.number().int().min(1).max(10000), pageSize: z.number().int().min(1).max(100) }).partial().strict();
 export const inputSchemas = {
   state: empty,
-  configure: z.object({ mockEnabled: z.boolean(), developerMode: z.boolean(), openCreatedSession: z.boolean(), baseUrl: z.string().max(2048), apiKey: z.string().max(4096), clearKey: z.boolean(), templates: z.array(template).min(1).max(20), defaultTemplateId: identity, mockScenario: z.enum(['normal','slow','empty','load-error','refresh-error','forbidden']) }).partial().strict(),
+  configure: z.object({ mockEnabled: z.boolean(), developerMode: z.boolean(), openCreatedSession: z.boolean(), launchInPlanMode: z.boolean(), baseUrl: z.string().max(2048), apiKey: z.string().max(4096), clearKey: z.boolean(), templates: z.array(template).min(1).max(20), defaultTemplateId: identity, mockScenario: z.enum(['normal','slow','empty','load-error','refresh-error','forbidden']) }).partial().strict(),
   check: empty,
   list: z.object({ filters: filters.optional(), refresh: z.boolean().optional() }).strict(),
   workspaces: empty,

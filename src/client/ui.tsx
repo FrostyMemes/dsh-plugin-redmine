@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { Filters, Health, Issue, Launch, ListResult, LogEntry, MockScenario, PluginApi, Row, Settings, State, Template, Workspace } from '../shared/contracts.js';
+import type { Filters, Health, HealthStep, Issue, Launch, ListResult, LogEntry, MockScenario, PluginApi, Row, Settings, State, Template, Workspace } from '../shared/contracts.js';
 import { DEFAULT_FILTERS } from '../shared/contracts.js';
 import { advanceEpoch, isCurrentEpoch } from '../shared/epoch.js';
 import { claimOnce } from '../shared/one-shot.js';
@@ -560,11 +560,19 @@ function StatusSelect({ statuses, value, onChange }: { statuses: { id: number; n
   return <MultiSelect label="Статусы" options={statuses.map(status => ({ id: String(status.id), name: status.name }))} selected={selected} onChange={onChange} allLabel="Все статусы" allSelected={allSelected} selectionLabel={selectionLabel} emptyHint={emptyHint}/>;
 }
 function HealthResults({ health }: { health: Health }) {
+  const [showSuccessful, setShowSuccessful] = useState(true);
+  const hasSuccessful = health.steps.some(step => step.status === 'ok');
+  const visibleSteps = filterVisibleHealthSteps(health.steps, showSuccessful);
   return <div className="rm-health-results">
     <p><strong>{health.mock ? 'Результат демо-проверки' : 'Состояние подключения'}: {HEALTH_LABELS[health.status]}</strong> · {fmtDate(health.checkedAt)}{health.stale ? ' · данные устарели' : ''}{health.user ? ` · ${health.user.name}` : ''}</p>
     {health.mock && <p className="rm-hint">Проверка выполнена в демо-режиме; соединение с Redmine не проверялось.</p>}
-    {health.steps.map((step, index) => <div className={`rm-health-row health-${step.status}`} key={`${step.name}-${index}`}><strong>{HEALTH_LABELS[step.status]} · {step.name}</strong><span>{step.message}{step.httpStatus ? ` · HTTP ${step.httpStatus}` : ''}</span></div>)}
+    {hasSuccessful && <div className="rm-health-filter"><button type="button" className="rm-link-button" aria-pressed={showSuccessful} onClick={() => setShowSuccessful(value => !value)}>{showSuccessful ? 'Убрать успешные проверки' : 'Показать успешные проверки'}</button></div>}
+    {visibleSteps.map((step, index) => <div className={`rm-health-row health-${step.status}`} key={`${step.name}-${index}`}><strong>{HEALTH_LABELS[step.status]} · {step.name}</strong><span>{step.message}{step.httpStatus ? ` · HTTP ${step.httpStatus}` : ''}</span></div>)}
   </div>;
+}
+
+export function filterVisibleHealthSteps(steps: HealthStep[], showSuccessful: boolean): HealthStep[] {
+  return showSuccessful ? steps : steps.filter(step => step.status !== 'ok');
 }
 
 export function RedmineSettings({ api }: PanelProps) {
@@ -572,7 +580,7 @@ export function RedmineSettings({ api }: PanelProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
-  const [modeSaving, setModeSaving] = useState<'mockEnabled' | 'developerMode' | 'openCreatedSession' | null>(null);
+  const [modeSaving, setModeSaving] = useState<'mockEnabled' | 'developerMode' | 'openCreatedSession' | 'launchInPlanMode' | null>(null);
   const [connectionError, setConnectionError] = useState('');
   const [connectionMessage, setConnectionMessage] = useState('');
   const [modeError, setModeError] = useState('');
@@ -585,6 +593,7 @@ export function RedmineSettings({ api }: PanelProps) {
   const [mockEnabled, setMockEnabled] = useState(false);
   const [developerMode, setDeveloperMode] = useState(false);
   const [openCreatedSession, setOpenCreatedSession] = useState(true);
+  const [launchInPlanMode, setLaunchInPlanMode] = useState(false);
   const [templates, setTemplates] = useState<Template[]>([]);
   const [defaultTemplateId, setDefaultTemplateId] = useState('');
   const [selectedTemplateId, setSelectedTemplateId] = useState('');
@@ -605,7 +614,7 @@ export function RedmineSettings({ api }: PanelProps) {
     void api.call('state', {}).then(saved => {
       if (!alive) return;
       setState(saved); setBaseUrl(saved.settings.baseUrl); setMockEnabled(saved.settings.mockEnabled);
-      setDeveloperMode(saved.settings.developerMode); setOpenCreatedSession(saved.settings.openCreatedSession);
+      setDeveloperMode(saved.settings.developerMode); setOpenCreatedSession(saved.settings.openCreatedSession); setLaunchInPlanMode(saved.settings.launchInPlanMode);
       setTemplates(saved.settings.templates); setDefaultTemplateId(saved.settings.defaultTemplateId); setHealth(saved.health);
       const selected = saved.settings.templates.find(template => template.id === saved.settings.defaultTemplateId) ?? saved.settings.templates[0];
       setSelectedTemplateId(selected?.id ?? ''); setTemplateName(selected?.name ?? ''); setTemplateText(selected?.text ?? '');
@@ -627,7 +636,7 @@ export function RedmineSettings({ api }: PanelProps) {
     finally { setSaving(false); }
   };
 
-  const saveMode = async (field: 'mockEnabled' | 'developerMode' | 'openCreatedSession', value: boolean) => {
+  const saveMode = async (field: 'mockEnabled' | 'developerMode' | 'openCreatedSession' | 'launchInPlanMode', value: boolean) => {
     if (!state || saving || checking || modeSaving) return;
     setModeSaving(field); setModeError(''); setModeMessage('');
     try {
@@ -635,12 +644,14 @@ export function RedmineSettings({ api }: PanelProps) {
         ? await api.call('configure', { mockEnabled: value })
         : field === 'developerMode'
           ? await api.call('configure', { developerMode: value })
-          : await api.call('configure', { openCreatedSession: value });
+        : field === 'openCreatedSession'
+          ? await api.call('configure', { openCreatedSession: value })
+          : await api.call('configure', { launchInPlanMode: value });
       setState(saved); setHealth(saved.health);
-      setMockEnabled(saved.settings.mockEnabled); setDeveloperMode(saved.settings.developerMode); setOpenCreatedSession(saved.settings.openCreatedSession);
-      setModeMessage(field === 'openCreatedSession' ? 'Настройка запуска сохранена' : 'Режим сохранён');
+      setMockEnabled(saved.settings.mockEnabled); setDeveloperMode(saved.settings.developerMode); setOpenCreatedSession(saved.settings.openCreatedSession); setLaunchInPlanMode(saved.settings.launchInPlanMode);
+      setModeMessage(field === 'openCreatedSession' || field === 'launchInPlanMode' ? 'Настройка запуска сохранена' : 'Режим сохранён');
     } catch (e) {
-      setMockEnabled(state.settings.mockEnabled); setDeveloperMode(state.settings.developerMode); setOpenCreatedSession(state.settings.openCreatedSession);
+      setMockEnabled(state.settings.mockEnabled); setDeveloperMode(state.settings.developerMode); setOpenCreatedSession(state.settings.openCreatedSession); setLaunchInPlanMode(state.settings.launchInPlanMode);
       setModeError(errText(e));
     } finally { setModeSaving(null); }
   };
@@ -786,11 +797,13 @@ export function RedmineSettings({ api }: PanelProps) {
       <p className="rm-hint">Журнал диагностики доступен при включённом режиме разработчика для демо- и реального подключения.</p>
       <label className="rm-checkbox"><input type="checkbox" checked={mockEnabled} disabled={settingsBusy} onChange={event => { setModeError(''); setModeMessage(''); setMockEnabled(event.target.checked); void saveMode('mockEnabled', event.target.checked); }}/><span>Использовать демонстрационные данные</span></label>
       <label className="rm-checkbox"><input type="checkbox" checked={developerMode} disabled={settingsBusy} onChange={event => { setModeError(''); setModeMessage(''); setDeveloperMode(event.target.checked); void saveMode('developerMode', event.target.checked); }}/><span>Режим разработчика и журнал диагностики</span></label>
-      {modeSaving && modeSaving !== 'openCreatedSession' && <p className="rm-hint" role="status">Сохранение режима…</p>}
+      {modeSaving && modeSaving !== 'openCreatedSession' && modeSaving !== 'launchInPlanMode' && <p className="rm-hint" role="status">Сохранение режима…</p>}
     </section>
     <section className="rm-settings-section"><h2>Запуск сессии</h2>
       <label className="rm-checkbox"><input type="checkbox" checked={openCreatedSession} disabled={settingsBusy} onChange={event => { setModeError(''); setModeMessage(''); setOpenCreatedSession(event.target.checked); void saveMode('openCreatedSession', event.target.checked); }}/><span>Открывать созданную сессию</span></label>
+      <label className="rm-checkbox"><input type="checkbox" checked={launchInPlanMode} disabled={settingsBusy} onChange={event => { setModeError(''); setModeMessage(''); setLaunchInPlanMode(event.target.checked); void saveMode('launchInPlanMode', event.target.checked); }}/><span>Запускать сессию в режиме планирования</span></label>
       {modeSaving === 'openCreatedSession' && <p className="rm-hint" role="status">Сохранение настройки запуска…</p>}
+      {modeSaving === 'launchInPlanMode' && <p className="rm-hint" role="status">Сохранение настройки запуска…</p>}
       <p className="rm-hint">При выключении новая сессия останется доступна в истории запусков на вкладке Redmine.</p>
     </section>
     {templateMessage && <div className="rm-notice" role="status">{templateMessage}</div>}{templateError && <div className="rm-error" role="alert" tabIndex={-1}>{templateError}</div>}
