@@ -40,6 +40,7 @@ export class PluginService {
   private filters: Filters = { ...DEFAULT_FILTERS, projects: [], statuses: ['open'], trackers: [], priorities: [], categories: [] };
   private health?: Health;
   private data?: ListResult;
+  private projectDetailsCache = new Map<string, { expiresAt: number; trackers?: Named[]; categories?: Named[] }>();
   private ns = 'unconfigured';
   private busy = new Map<string, Promise<Launch>>();
   private generation = 0;
@@ -110,6 +111,7 @@ export class PluginService {
     const nextCandidatePrefix = this.scopePrefix(candidate);
     const scopeChanges = old !== nextCandidatePrefix || credentialsChanged || candidate.mockScenario !== this.settings.mockScenario;
     if (scopeChanges) this.invalidateRequests();
+    if (scopeChanges || credentialsChanged) this.projectDetailsCache.clear();
     if (credentialsChanged) this.rememberKey(await this.o.credentials.resolve());
     if (p.apiKey !== undefined) await this.o.credentials.set(p.apiKey); if (p.clearKey) await this.o.credentials.clear();
     this.settings = candidate;
@@ -145,8 +147,25 @@ export class PluginService {
     let sampleProjectId: number | undefined;
     steps.push(await this.step('Проекты', async () => { const x = await this.getJson('projects.json?limit=1', ctx!); if (!Array.isArray(x.projects)) throw new Error('Unexpected projects response'); sampleProjectId = Number(x.projects[0]?.id) || undefined; }, true));
     steps.push(await this.step('Задачи', async () => { const x = await this.getJson('issues.json?limit=1', ctx!); if (!Array.isArray(x.issues)) throw new Error('Unexpected issues response'); }, true));
-    for (const [name, path] of [['Статусы', 'issue_statuses.json'], ['Типы задач', 'trackers.json'], ['Приоритеты', 'enumerations/issue_priorities.json']]) steps.push(await this.step(name, async () => { const x = await this.getJson(path, ctx!); const arr = Object.values(x).find(Array.isArray); if (!arr) throw new Error('Unexpected response shape'); }));
-    steps.push(sampleProjectId ? await this.step('Категории', async () => { const x = await this.getJson(`projects/${sampleProjectId}/issue_categories.json?limit=1`, ctx!); if (!Array.isArray(x.issue_categories)) throw new Error('Unexpected categories response'); }) : { name: 'Категории', status: 'skipped', message: 'Нет доступного проекта для проверки категорий' });
+    for (const [name, path] of [['Статусы', 'issue_statuses.json'], ['Приоритеты', 'enumerations/issue_priorities.json']]) steps.push(await this.step(name, async () => { const x = await this.getJson(path, ctx!); const arr = Object.values(x).find(Array.isArray); if (!arr) throw new Error('Unexpected response shape'); }));
+    if (sampleProjectId) {
+      let project: any;
+      const categoriesStep = await this.step('Категории', async () => {
+        const x = await this.getJson(`projects/${sampleProjectId}.json?include=trackers,issue_categories`, ctx!);
+        project = x.project;
+        if (!project || typeof project !== 'object' || Array.isArray(project) || !Array.isArray(project.issue_categories)) throw new Error('Ответ проекта не содержит список категорий');
+      });
+      if (categoriesStep.status === 'ok') categoriesStep.message = `Список доступен (проект #${sampleProjectId})`;
+      steps.push(categoriesStep);
+      const trackersStep = project
+        ? await this.step('Типы задач', async () => { if (!Array.isArray(project.trackers)) throw new Error('Ответ проекта не содержит список типов задач'); })
+        : { ...categoriesStep, name: 'Типы задач' };
+      if (trackersStep.status === 'ok') trackersStep.message = `Список доступен (проект #${sampleProjectId})`;
+      steps.push(trackersStep);
+    } else {
+      steps.push({ name: 'Категории', status: 'skipped', message: 'Нет доступного проекта для проверки категорий' });
+      steps.push({ name: 'Типы задач', status: 'skipped', message: 'Нет доступного проекта для проверки типов задач' });
+    }
     this.assertGeneration(generation);
     this.health = { status: steps.some(x => x.status === 'error') ? 'error' : steps.some(x => x.status === 'warning') ? 'warning' : 'ok', checkedAt: now(), mock: false, stale: false, ...(user ? { user } : {}), steps }; await this.persistHealth(); await this.log(this.health.status === 'ok' ? 'info' : 'warning', 'healthcheck', 'Connection check finished', { status: this.health.status }); return this.health;
   }
@@ -220,7 +239,7 @@ export class PluginService {
       return { rows, total: totalCount, incomplete: capped };
     };
     let loaded = await loadIssues('*'); let issues = loaded.rows, itotal = loaded.total, incomplete = loaded.incomplete;
-    const warnings: string[] = []; const catalogs: [string, string, string][] = [['statuses','issue_statuses.json','issue_statuses'],['trackers','trackers.json','trackers'],['priorities','enumerations/issue_priorities.json','issue_priorities']];
+    const warnings: string[] = []; const catalogs: [string, string, string][] = [['statuses','issue_statuses.json','issue_statuses'],['priorities','enumerations/issue_priorities.json','issue_priorities']];
     const catalog: Catalog = { projects, statuses: [], trackers: [], priorities: [], categories: [], warnings };
     for (const [prop, path, field] of catalogs) { try { const x = await get(path); if (!Array.isArray(x[field])) throw new Error('Unexpected response shape'); (catalog as any)[prop] = x[field].map((v: any) => ({ ...named(v), ...(prop === 'statuses' && typeof v.is_closed === 'boolean' ? { closed: v.is_closed } : {}) })).filter((v: any) => v.id && v.name); } catch (e) { warnings.push(`${prop}: ${safeMessage(e)}`); } }
     const closedByStatus = new Map(catalog.statuses.map(s => [s.id, s.closed]));
@@ -233,7 +252,53 @@ export class PluginService {
       warnings.push('statuses: серверный справочник недоступен; задачи объединены из серверных групп open и closed');
     }
     const neededProjects = this.filters.projects.length ? projects.filter(p => this.filters.projects.includes(p.id)) : [...new Map(issues.map(i => [i.project.id, i.project])).values()];
-    for (const p of neededProjects) { try { let offset = 0, count = Infinity; while (offset < count) { const x = await get(`projects/${p.id}/issue_categories.json?limit=100&offset=${offset}`); if (!Array.isArray(x.issue_categories)) throw new Error('Unexpected response shape'); catalog.categories.push(...x.issue_categories.map((c: any) => { const n = named(c); return n ? { ...n, projectId: p.id } : undefined; }).filter(Boolean) as Category[]); count = Number.isFinite(Number(x.total_count)) ? Number(x.total_count) : x.issue_categories.length; if (!x.issue_categories.length) break; offset += x.issue_categories.length; } } catch (e) { warnings.push(`categories:${p.id}: ${safeMessage(e, ctx.key)}`); } }
+    const categoryProjectIds = new Set(neededProjects.map(p => p.id));
+    const trackerById = new Map<number, Named>();
+    for (const issue of issues) if (issue.tracker) trackerById.set(issue.tracker.id, issue.tracker);
+    for (const [key, value] of this.projectDetailsCache) if (value.expiresAt <= Date.now()) this.projectDetailsCache.delete(key);
+    const projectDetails = async (p: Named) => {
+      const key = `${ctx.base}:${user.id}:${p.id}`, cached = this.projectDetailsCache.get(key);
+      if (cached && cached.expiresAt > Date.now()) return cached;
+      const x = await get(`projects/${p.id}.json?include=trackers,issue_categories`), project = x.project;
+      this.assertGeneration(generation);
+      if (!project || typeof project !== 'object' || Array.isArray(project)) throw new Error('Unexpected project response');
+      const details = {
+        expiresAt: Date.now() + 5 * 60 * 1000,
+        ...(Array.isArray(project.trackers) ? { trackers: project.trackers.map(named).filter(Boolean) as Named[] } : {}),
+        ...(Array.isArray(project.issue_categories) ? { categories: project.issue_categories.map(named).filter(Boolean) as Named[] } : {}),
+      };
+      if (details.trackers && details.categories) this.projectDetailsCache.set(key, details);
+      return details;
+    };
+    // The project-details endpoint is the supported source for trackers on this Redmine.
+    // Walk every accessible project so the tracker filter is complete even when no current
+    // assigned issue uses a tracker's project. Categories remain scoped to selected/relevant projects.
+    for (let start = 0; start < projects.length; start += 6) {
+      const batch = projects.slice(start, start + 6);
+      const results = await Promise.all(batch.map(async p => {
+        try { return { p, details: await projectDetails(p) }; }
+        catch (e) { return { p, error: safeMessage(e, ctx.key) }; }
+      }));
+      this.assertGeneration(generation);
+      for (const result of results) {
+        const { p } = result;
+        if ('error' in result) {
+          if (categoryProjectIds.has(p.id)) warnings.push(`categories:${p.id}: ${result.error}`);
+          warnings.push(`trackers:${p.id}: ${result.error}`);
+          continue;
+        }
+        if (categoryProjectIds.has(p.id)) {
+          if (result.details.categories) catalog.categories.push(...result.details.categories.map(c => ({ ...c, projectId: p.id })));
+          else warnings.push(`categories:${p.id}: Ответ проекта не содержит списка категорий`);
+        }
+        if (result.details.trackers) {
+          for (const tracker of result.details.trackers) trackerById.set(tracker.id, tracker);
+        } else {
+          warnings.push(`trackers:${p.id}: Ответ проекта не содержит списка типов задач`);
+        }
+      }
+    }
+    catalog.trackers = [...trackerById.values()].sort((a, b) => a.id - b.id);
     this.assertGeneration(generation);
     return { rows: issues.map(issue => ({ issue, launches: [] })), total: itotal, catalog, filters: { ...this.filters }, fetchedAt: now(), incomplete, user };
   }

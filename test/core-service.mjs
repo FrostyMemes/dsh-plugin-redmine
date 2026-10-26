@@ -26,34 +26,32 @@ test('real Redmine uses GET, API key header, paginates old REST responses, and e
     if(path==='projects.json') { const offset=Number(u.searchParams.get('offset')||0); return json({projects:offset?[]:[{id:1,name:'P'}],total_count:1}); }
     if(path==='issues.json') { issueRequest=u; const offset=Number(u.searchParams.get('offset')||0); return json({issues:offset?[]:[{id:3,subject:'Subject',description:'DO NOT KEEP',project:{id:1,name:'P'},status:{id:2,name:'Open'},assigned_to:{id:5,name:'Ada'},updated_on:'2025-01-01'},{id:4,subject:'Other user',project:{id:1,name:'P'},status:{id:2,name:'Open'},assigned_to:{id:9,name:'Not Ada'}},{id:6,subject:'Closed item',project:{id:1,name:'P'},status:{id:5,name:'Closed'},assigned_to:{id:5,name:'Ada'}}],total_count:3}); }
     if(path==='issue_statuses.json') return json({issue_statuses:[{id:2,name:'Open',is_closed:false},{id:5,name:'Closed',is_closed:true}]});
-    if(path==='trackers.json') return json({trackers:[]});
     if(path==='issue_priorities.json') return json({issue_priorities:[]});
-    if(path==='issue_categories.json') return json({issue_categories:[]});
+    if(/^\d+\.json$/.test(path)) return json({project:{id:Number(path.slice(0,-5)),trackers:[{id:3,name:'Bug'}],issue_categories:[]}});
     throw Error(path);
   };
   const s=await h.service({fetch}); await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine.example/base',apiKey:'topsecret'}); const result=await s.call('list',{});
   assert.equal(issueRequest.searchParams.get('assigned_to_id'),'me'); assert.equal(issueRequest.searchParams.get('status_id'),'*');
   assert.equal(result.total,1);
   assert.equal(result.rows[0].issue.url,'https://redmine.example/base/issues/3'); assert.equal('description' in result.rows[0].issue,false);
-  assert.equal(result.user.name,'Ada Lovelace'); assert.equal(requests.filter(x=>new URL(x).pathname.endsWith('issue_categories.json')).length,1);
+  assert.equal(result.user.name,'Ada Lovelace'); assert.deepEqual(result.catalog.trackers,[{id:3,name:'Bug'}]); assert.equal(requests.filter(x=>new URL(x).pathname.endsWith('issue_categories.json')).length,0); assert.ok(requests.some(x=>new URL(x).pathname.endsWith('/projects/1.json') && new URL(x).searchParams.get('include')==='trackers,issue_categories'));
   const filtered=await s.call('list',{filters:{statuses:['5'],search:'#6'}}); assert.equal(filtered.total,1); assert.equal(filtered.rows[0].issue.id,6);
   const all=await s.call('list',{filters:{statuses:['*'],search:''}}); assert.equal(all.total,2);
 });
 
-test('all project pages are fetched, categories are lazy, and server-open fallback works without status catalog', async () => {
+test('all project pages are fetched, categories stay scoped, and server-open fallback works without status catalog', async () => {
   const h=harness(), projectOffsets=[]; const fetch=async (url,init) => {
     assert.equal(init.method,'GET'); const u=new URL(url), path=u.pathname.split('/').at(-1);
     if(path==='current.json') return json({user:{id:5,login:'ada'}});
     if(path==='projects.json') { const off=Number(u.searchParams.get('offset')||0); projectOffsets.push(off); return json({projects:off===0?Array.from({length:100},(_,i)=>({id:i+1,name:`P${i+1}`})):[{id:101,name:'P101'}],total_count:101}); }
     if(path==='issues.json') { const status=u.searchParams.get('status_id'), all=[{id:7,subject:'Unknown open',project:{id:1,name:'P1'},status:{id:9,name:'New'},assigned_to:{id:5,name:'Ada'}},{id:8,subject:'Unknown closed',project:{id:1,name:'P1'},status:{id:10,name:'Done'},assigned_to:{id:5,name:'Ada'}}]; const rows=status==='open'?[all[0]]:status==='closed'?[all[1]]:all; return json({issues:rows,total_count:rows.length}); }
     if(path==='issue_statuses.json') return json({},403);
-    if(path==='trackers.json') return json({trackers:[]});
     if(path==='issue_priorities.json') return json({issue_priorities:[]});
-    if(path==='issue_categories.json') return json({issue_categories:[{id:1,name:'Common'}],total_count:1});
+    if(/^\d+\.json$/.test(path)) { const id=Number(path.slice(0,-5)); return json({project:{id,trackers:[{id:id===101?12:4,name:id===101?'Other project type':'Task'}],issue_categories:id===1?[{id:1,name:'Common'}]:[]}}); }
     throw Error(path);
   };
   const s=await h.service({fetch}); await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine.example',apiKey:'k'}); const result=await s.call('list',{});
-  assert.deepEqual(projectOffsets,[0,100]); assert.equal(result.catalog.projects.length,101); assert.deepEqual(result.catalog.categories.map(c=>c.projectId),[1]);
+  assert.deepEqual(projectOffsets,[0,100]); assert.equal(result.catalog.projects.length,101); assert.deepEqual(result.catalog.categories.map(c=>c.projectId),[1]); assert.ok(result.catalog.trackers.some(t=>t.id===12 && t.name==='Other project type'));
   assert.equal(result.rows.length,1); assert.equal(result.rows[0].issue.id,7); assert.equal(result.rows[0].issue.status.closed,false); assert.ok(result.catalog.warnings.some(x=>x.startsWith('statuses:')));
   const all=await s.call('list',{filters:{statuses:['*']}}); assert.equal(all.total,2); assert.deepEqual(all.rows.map(r=>r.issue.status.closed).sort(),[false,true]);
   const closed=await s.call('list',{filters:{statuses:['closed']}}); assert.equal(closed.total,1); assert.equal(closed.rows[0].issue.id,8);
@@ -63,6 +61,74 @@ test('healthcheck distinguishes forbidden and mock health does not claim a real 
   const h=harness(), s=await h.service({fetch:async()=>json({},403)}); const mock=await s.call('check',{}); assert.equal(mock.mock,true); assert.equal(mock.status,'warning');
   await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine.example',apiKey:'secret'});
   const bad=await s.call('check',{}); assert.equal(bad.status,'error'); assert.ok(bad.steps.some(x=>x.httpStatus===403)); assert.match(bad.steps.find(x=>x.httpStatus===403).message,/прав/);
+});
+
+test('healthcheck validates categories and trackers through project details and reports sample scope', async () => {
+  const h=harness(), requests=[]; const fetch=async (url,init) => {
+    const u=new URL(url), path=u.pathname.split('/').at(-1); requests.push(u);
+    assert.equal(init.method,'GET');
+    if(path==='current.json') return json({user:{id:5,login:'ada'}});
+    if(path==='projects.json') return json({projects:[{id:21,name:'Sample'}],total_count:1});
+    if(path==='issues.json') return json({issues:[],total_count:0});
+    if(path==='issue_statuses.json') return json({issue_statuses:[]});
+    if(path==='issue_priorities.json') return json({issue_priorities:[]});
+    if(path==='21.json') return json({project:{id:21,trackers:[{id:4,name:'Bug'}],issue_categories:[]}});
+    throw Error(path);
+  };
+  const s=await h.service({fetch}); await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine.example',apiKey:'k'});
+  const health=await s.call('check',{});
+  assert.equal(health.status,'ok'); assert.equal(health.steps.find(x=>x.name==='Категории').message,'Список доступен (проект #21)'); assert.equal(health.steps.find(x=>x.name==='Типы задач').message,'Список доступен (проект #21)');
+  assert.equal(requests.filter(u=>/issue_categories\.json$/.test(u.pathname)).length,0); assert.equal(requests.filter(u=>u.pathname.endsWith('/projects/21.json')).length,1);
+});
+
+test('healthcheck keeps categories available when project details omit trackers', async () => {
+  const h=harness(), fetch=async url => {
+    const u=new URL(url), path=u.pathname.split('/').at(-1);
+    if(path==='current.json') return json({user:{id:5,login:'ada'}});
+    if(path==='projects.json') return json({projects:[{id:21,name:'Sample'}],total_count:1});
+    if(path==='issues.json') return json({issues:[],total_count:0});
+    if(path==='issue_statuses.json') return json({issue_statuses:[]});
+    if(path==='issue_priorities.json') return json({issue_priorities:[]});
+    if(path==='21.json') return json({project:{id:21,issue_categories:[]}});
+    throw Error(path);
+  };
+  const s=await h.service({fetch}); await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine.example',apiKey:'k'});
+  const health=await s.call('check',{});
+  assert.equal(health.status,'warning'); assert.equal(health.steps.find(x=>x.name==='Категории').status,'ok'); assert.equal(health.steps.find(x=>x.name==='Типы задач').status,'warning');
+});
+
+test('healthcheck repeats the project endpoint failure for both project capabilities', async () => {
+  const h=harness(), fetch=async url => {
+    const u=new URL(url), path=u.pathname.split('/').at(-1);
+    if(path==='current.json') return json({user:{id:5,login:'ada'}});
+    if(path==='projects.json') return json({projects:[{id:21,name:'Sample'}],total_count:1});
+    if(path==='issues.json') return json({issues:[],total_count:0});
+    if(path==='issue_statuses.json') return json({issue_statuses:[]});
+    if(path==='issue_priorities.json') return json({issue_priorities:[]});
+    if(path==='21.json') return json({errors:['Not found']},404);
+    throw Error(path);
+  };
+  const s=await h.service({fetch}); await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine.example',apiKey:'k'});
+  const health=await s.call('check',{}), categories=health.steps.find(x=>x.name==='Категории'), trackers=health.steps.find(x=>x.name==='Типы задач');
+  assert.equal(categories.httpStatus,404); assert.equal(trackers.httpStatus,404); assert.equal(trackers.message,categories.message);
+});
+
+test('partial project details are retried on refresh so trackers can recover', async () => {
+  const h=harness(); let detailCalls=0; const fetch=async url => {
+    const u=new URL(url), path=u.pathname.split('/').at(-1);
+    if(path==='current.json') return json({user:{id:5,login:'ada'}});
+    if(path==='projects.json') return json({projects:[{id:21,name:'Sample'}],total_count:1});
+    if(path==='issues.json') return json({issues:[],total_count:0});
+    if(path==='issue_statuses.json') return json({issue_statuses:[]});
+    if(path==='issue_priorities.json') return json({issue_priorities:[]});
+    if(path==='21.json') { detailCalls++; return json({project:{id:21,issue_categories:[],...(detailCalls > 1 ? {trackers:[{id:4,name:'Recovered'}]} : {})}}); }
+    throw Error(path);
+  };
+  const s=await h.service({fetch}); await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine.example',apiKey:'k'});
+  const filters={projects:[21]}; const incomplete=await s.call('list',{filters});
+  assert.ok(incomplete.catalog.warnings.some(x=>x.startsWith('trackers:21:')));
+  const recovered=await s.call('list',{filters,refresh:true});
+  assert.deepEqual(recovered.catalog.trackers,[{id:4,name:'Recovered'}]); assert.equal(detailCalls,2);
 });
 
 test('launch retries reuse a session and request ID; duplicate operation is one session', async () => {
@@ -120,9 +186,9 @@ test('in-flight Redmine work keeps its captured URL/key and cannot continue afte
     if(path==='projects.json') return json({projects:[],total_count:0});
     if(path==='issues.json') return json({issues:[],total_count:0});
     if(path==='issue_statuses.json') return json({issue_statuses:[]});
-    if(path==='trackers.json') return json({trackers:[]});
     if(path==='issue_priorities.json') return json({issue_priorities:[]});
-    return json({issue_categories:[],total_count:0});
+    if(/^\d+\.json$/.test(path)) return json({project:{id:Number(path.slice(0,-5)),trackers:[],issue_categories:[]}});
+    return json({});
   };
   const s=await h.service({fetch}); await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine-a.example',apiKey:'key-A'});
   const old=s.call('list',{refresh:true}); await startedA; await s.call('configure',{baseUrl:'https://redmine-b.example',apiKey:'key-B'});
@@ -148,8 +214,8 @@ test('concurrent list requests are serialized so older filters cannot overwrite 
     if(path==='projects.json') return json({projects:[{id:1,name:'One'},{id:2,name:'Two'}],total_count:2});
     if(path==='issues.json') return json({issues:[{id:21,subject:'One task',project:{id:1,name:'One'},status:{id:2,name:'Open',is_closed:false},assigned_to:{id:5,name:'Ada'}},{id:22,subject:'Two task',project:{id:2,name:'Two'},status:{id:2,name:'Open',is_closed:false},assigned_to:{id:5,name:'Ada'}}],total_count:2});
     if(path==='issue_statuses.json') return json({issue_statuses:[{id:2,name:'Open',is_closed:false}]});
-    if(path==='trackers.json') return json({trackers:[]}); if(path==='issue_priorities.json') return json({issue_priorities:[]});
-    if(path==='issue_categories.json') return json({issue_categories:[],total_count:0}); throw Error(path);
+    if(path==='issue_priorities.json') return json({issue_priorities:[]});
+    if(/^\d+\.json$/.test(path)) return json({project:{id:Number(path.slice(0,-5)),trackers:[],issue_categories:[]}}); throw Error(path);
   };
   const s=await h.service({fetch}); await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine.example',apiKey:'k'});
   const a=s.call('list',{refresh:true,filters:{projects:[1]}}); await firstStarted;
