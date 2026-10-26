@@ -6,7 +6,7 @@ export interface Issue { id: number; subject: string; project: Named; status: Na
 export interface Workspace { id: string; name: string; path: string; available: boolean }
 export interface Template { id: string; name: string; text: string }
 export type MockScenario = 'normal' | 'slow' | 'empty' | 'load-error' | 'refresh-error' | 'forbidden';
-export interface Settings { mockEnabled: boolean; developerMode: boolean; baseUrl: string; keyConfigured: boolean; templates: Template[]; defaultTemplateId: string; mockScenario: MockScenario }
+export interface Settings { mockEnabled: boolean; developerMode: boolean; openCreatedSession: boolean; baseUrl: string; keyConfigured: boolean; templates: Template[]; defaultTemplateId: string; mockScenario: MockScenario }
 export interface Filters { projects: number[]; statuses: string[]; trackers: number[]; priorities: number[]; categories: number[]; search: string; sort: 'updated-desc' | 'updated-asc' | 'id-desc' | 'subject-asc'; page: number; pageSize: number }
 export interface Catalog { projects: Named[]; statuses: (Named & { closed?: boolean })[]; trackers: Named[]; priorities: Named[]; categories: Category[]; warnings: string[] }
 export interface HealthStep { name: string; status: 'ok' | 'warning' | 'error' | 'skipped'; message: string; httpStatus?: number }

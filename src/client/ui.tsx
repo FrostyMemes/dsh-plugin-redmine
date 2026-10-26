@@ -281,7 +281,7 @@ export function RedminePanel({ api }: PanelProps) {
       setResult(current => current ? ({ ...current, rows: current.rows.map(r => r.issue.id === row.issue.id ? { ...r, launches: [started, ...r.launches.filter(x => x.operationId !== started.operationId)] } : r) }) : current);
       if (started.status === 'failed') { setError(started.error || 'Не удалось запустить сессию. Повторите попытку.'); clientEvent('error', 'launch'); return; }
       setNotice(started.status === 'sent' ? 'Промпт отправлен в новую сессию.' : 'Сессия создана. Проверяем доступность…');
-      await openSession(started);
+      if (remote?.settings.openCreatedSession !== false) await openSession(started);
     } catch (e) {
       setError(`${errText(e)} Повторите отправку из истории запусков, если операция была сохранена.`); clientEvent('error', 'launch');
       try { setResult(await api.call('list', { filters })); } catch { /* the existing issue list remains visible */ }
@@ -481,7 +481,7 @@ export function RedmineSettings({ api }: PanelProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
-  const [modeSaving, setModeSaving] = useState<'mockEnabled' | 'developerMode' | null>(null);
+  const [modeSaving, setModeSaving] = useState<'mockEnabled' | 'developerMode' | 'openCreatedSession' | null>(null);
   const [connectionError, setConnectionError] = useState('');
   const [connectionMessage, setConnectionMessage] = useState('');
   const [modeError, setModeError] = useState('');
@@ -493,6 +493,7 @@ export function RedmineSettings({ api }: PanelProps) {
   const [clearKey, setClearKey] = useState(false);
   const [mockEnabled, setMockEnabled] = useState(false);
   const [developerMode, setDeveloperMode] = useState(false);
+  const [openCreatedSession, setOpenCreatedSession] = useState(true);
   const [templates, setTemplates] = useState<Template[]>([]);
   const [defaultTemplateId, setDefaultTemplateId] = useState('');
   const [selectedTemplateId, setSelectedTemplateId] = useState('');
@@ -513,7 +514,7 @@ export function RedmineSettings({ api }: PanelProps) {
     void api.call('state', {}).then(saved => {
       if (!alive) return;
       setState(saved); setBaseUrl(saved.settings.baseUrl); setMockEnabled(saved.settings.mockEnabled);
-      setDeveloperMode(saved.settings.developerMode);
+      setDeveloperMode(saved.settings.developerMode); setOpenCreatedSession(saved.settings.openCreatedSession);
       setTemplates(saved.settings.templates); setDefaultTemplateId(saved.settings.defaultTemplateId); setHealth(saved.health);
       const selected = saved.settings.templates.find(template => template.id === saved.settings.defaultTemplateId) ?? saved.settings.templates[0];
       setSelectedTemplateId(selected?.id ?? ''); setTemplateName(selected?.name ?? ''); setTemplateText(selected?.text ?? '');
@@ -535,18 +536,20 @@ export function RedmineSettings({ api }: PanelProps) {
     finally { setSaving(false); }
   };
 
-  const saveMode = async (field: 'mockEnabled' | 'developerMode', value: boolean) => {
+  const saveMode = async (field: 'mockEnabled' | 'developerMode' | 'openCreatedSession', value: boolean) => {
     if (!state || saving || checking || modeSaving) return;
     setModeSaving(field); setModeError(''); setModeMessage('');
     try {
       const saved = field === 'mockEnabled'
         ? await api.call('configure', { mockEnabled: value })
-        : await api.call('configure', { developerMode: value });
+        : field === 'developerMode'
+          ? await api.call('configure', { developerMode: value })
+          : await api.call('configure', { openCreatedSession: value });
       setState(saved); setHealth(saved.health);
-      setMockEnabled(saved.settings.mockEnabled); setDeveloperMode(saved.settings.developerMode);
-      setModeMessage('Режим сохранён');
+      setMockEnabled(saved.settings.mockEnabled); setDeveloperMode(saved.settings.developerMode); setOpenCreatedSession(saved.settings.openCreatedSession);
+      setModeMessage(field === 'openCreatedSession' ? 'Настройка запуска сохранена' : 'Режим сохранён');
     } catch (e) {
-      setMockEnabled(state.settings.mockEnabled); setDeveloperMode(state.settings.developerMode);
+      setMockEnabled(state.settings.mockEnabled); setDeveloperMode(state.settings.developerMode); setOpenCreatedSession(state.settings.openCreatedSession);
       setModeError(errText(e));
     } finally { setModeSaving(null); }
   };
@@ -692,7 +695,12 @@ export function RedmineSettings({ api }: PanelProps) {
       <p className="rm-hint">Журнал диагностики доступен при включённом режиме разработчика для демо- и реального подключения.</p>
       <label className="rm-checkbox"><input type="checkbox" checked={mockEnabled} disabled={settingsBusy} onChange={event => { setModeError(''); setModeMessage(''); setMockEnabled(event.target.checked); void saveMode('mockEnabled', event.target.checked); }}/><span>Использовать демонстрационные данные</span></label>
       <label className="rm-checkbox"><input type="checkbox" checked={developerMode} disabled={settingsBusy} onChange={event => { setModeError(''); setModeMessage(''); setDeveloperMode(event.target.checked); void saveMode('developerMode', event.target.checked); }}/><span>Режим разработчика и журнал диагностики</span></label>
-      {modeSaving && <p className="rm-hint" role="status">Сохранение режима…</p>}
+      {modeSaving && modeSaving !== 'openCreatedSession' && <p className="rm-hint" role="status">Сохранение режима…</p>}
+    </section>
+    <section className="rm-settings-section"><h2>Запуск сессии</h2>
+      <label className="rm-checkbox"><input type="checkbox" checked={openCreatedSession} disabled={settingsBusy} onChange={event => { setModeError(''); setModeMessage(''); setOpenCreatedSession(event.target.checked); void saveMode('openCreatedSession', event.target.checked); }}/><span>Открывать созданную сессию</span></label>
+      {modeSaving === 'openCreatedSession' && <p className="rm-hint" role="status">Сохранение настройки запуска…</p>}
+      <p className="rm-hint">При выключении новая сессия останется доступна в истории запусков на вкладке Redmine.</p>
     </section>
     {templateMessage && <div className="rm-notice" role="status">{templateMessage}</div>}{templateError && <div className="rm-error" role="alert" tabIndex={-1}>{templateError}</div>}
     <section className="rm-settings-section"><div className="rm-template-heading"><h2>Шаблоны запуска</h2><TemplateVariablesHelp/></div>
