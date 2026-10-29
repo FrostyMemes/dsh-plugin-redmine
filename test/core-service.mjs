@@ -243,6 +243,51 @@ test('issue session preflight returns only live sessions recorded for that loade
   await assert.rejects(s.call('issueSessions',{issueId:999999,expectedContextGeneration:data.contextGeneration}),/loaded metadata list/);
 });
 
+test('list rows show one latest launch per live DSH session and retain retries for unavailable sessions', async () => {
+  const h=harness(), s=await h.service(), data=await s.call('list',{});
+  const [issueA,issueB]=data.rows.slice(0,2).map(row=>row.issue.id);
+  const launch=(operationId,issueId,sessionId,status,createdAt)=>({operationId,issueId,workspaceId:'w1',sessionId,requestId:operationId,status,createdAt});
+  h.db.values.set(`redmine.scope.mock:user:7.issueLaunches.${issueA}`,[
+    launch('shared-old',issueA,'shared-session','sent','2026-01-01T00:00:00.000Z'),
+    launch('shared-latest',issueA,'shared-session','sent','2026-01-02T00:00:00.000Z'),
+    launch('deleted-session',issueA,'deleted-session','sent','2026-01-03T00:00:00.000Z'),
+    launch('archived-session',issueA,'archived-session','sent','2026-01-04T00:00:00.000Z'),
+    launch('retry-failed',issueA,'redmine-retry-failed','failed','2026-01-05T00:00:00.000Z'),
+    launch('retry-running',issueA,'redmine-retry-running','sending','2026-01-06T00:00:00.000Z'),
+    launch('failed-live-session',issueA,'live-failed-session','failed','2026-01-07T00:00:00.000Z'),
+    {...launch('preset-mismatch-live',issueA,'mismatch-session','failed','2026-01-08T00:00:00.000Z'),planModePresetMismatch:true},
+    launch('wrong-issue-record',issueB, 'wrong-issue-record','sent','2026-01-07T00:00:00.000Z'),
+  ]);
+  h.db.values.set(`redmine.scope.mock:user:7.issueLaunches.${issueB}`,[
+    launch('cold-persisted',issueB,'persisted-session','sent','2026-01-08T00:00:00.000Z'),
+  ]);
+  const sessionBatches=[];
+  h.dsh.existingSessions=async ids=>{ sessionBatches.push([...ids]); return ids.filter(id=>id==='shared-session'||id==='persisted-session'||id==='live-failed-session'||id==='mismatch-session'); };
+
+  const result=await s.call('list',{});
+  const rowA=result.rows.find(row=>row.issue.id===issueA), rowB=result.rows.find(row=>row.issue.id===issueB);
+  assert.equal(sessionBatches.length,1);
+  assert.equal(sessionBatches[0].filter(id=>id==='shared-session').length,1);
+  assert.equal(sessionBatches[0].includes('wrong-issue-record'),false);
+  assert.deepEqual(rowA.sessions.map(item=>item.operationId),['failed-live-session','shared-latest']);
+  assert.deepEqual(rowB.sessions.map(item=>item.operationId),['cold-persisted']);
+  assert.deepEqual(rowA.launches.map(item=>item.operationId),['preset-mismatch-live','failed-live-session','retry-running','retry-failed']);
+  assert.equal(rowA.sessions.some(item=>item.sessionId==='deleted-session'||item.sessionId==='archived-session'||item.sessionId==='mismatch-session'),false);
+});
+
+test('session batch failures leave tasks visible and show only a generic sync warning', async () => {
+  const h=harness(), s=await h.service(), issueId=(await s.call('list',{})).rows[0].issue.id;
+  h.db.values.set(`redmine.scope.mock:user:7.issueLaunches.${issueId}`,[
+    {operationId:'live-session',issueId,workspaceId:'w1',sessionId:'linked-session',requestId:'live-session',status:'sent',createdAt:'2026-01-01T00:00:00.000Z'},
+  ]);
+  h.dsh.existingSessions=async()=>{ throw Error('sensitive lower-level details'); };
+  const result=await s.call('list',{}), row=result.rows.find(item=>item.issue.id===issueId);
+  assert.ok(row);
+  assert.equal(row.sessionSyncWarning,true);
+  assert.deepEqual(row.sessions,[]);
+  assert.doesNotMatch(JSON.stringify(result),/sensitive lower-level details/);
+});
+
 test('choosing an existing issue session sends the selected template to that same session without creating or renaming', async () => {
   const h=harness();
   const fetch=async url => {

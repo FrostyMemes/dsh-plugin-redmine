@@ -12,7 +12,7 @@ export interface Catalog { projects: Named[]; statuses: (Named & { closed?: bool
 export interface HealthStep { name: string; status: 'ok' | 'warning' | 'error' | 'skipped'; message: string; httpStatus?: number }
 export interface Health { status: 'ok' | 'warning' | 'error'; checkedAt: string; mock: boolean; stale: boolean; user?: Named; steps: HealthStep[] }
 export interface Launch { operationId: string; issueId: number; workspaceId: string; sessionId: string; requestId: string; sessionTitle?: string; templateId?: string; promptSnapshotVersion?: number; titleApplied?: boolean; reusedSession?: boolean; sessionCreatedAt?: string; planModeOnLaunch?: boolean; agentPreset?: string; planModePresetMismatch?: boolean; retryBlocked?: boolean; status: 'creating' | 'sending' | 'sent' | 'failed'; createdAt: string; error?: string }
-export interface Row { issue: Issue; workspace?: Workspace; launches: Launch[] }
+export interface Row { issue: Issue; workspace?: Workspace; sessions: Launch[]; launches: Launch[]; sessionSyncWarning?: boolean }
 export interface ListResult { rows: Row[]; total: number; catalog: Catalog; filters: Filters; fetchedAt: string; incomplete: boolean; user: Named; contextGeneration: number }
 export interface LogEntry { id: string; time: string; level: Level; component: string; operation: string; message: string; fields: Record<string, string | number | boolean | null> }
 export interface State { settings: Settings; filters: Filters; contextGeneration: number; health?: Health }

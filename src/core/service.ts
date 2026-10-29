@@ -224,7 +224,7 @@ export class PluginService {
   private async mockList(generation: number): Promise<ListResult> {
     const scenario = this.settings.mockScenario; if (scenario === 'slow') await new Promise(r => setTimeout(r, 500)); if (scenario === 'load-error' || scenario === 'refresh-error' || scenario === 'forbidden') throw new Error(scenario === 'forbidden' ? 'Демо: смоделирован отказ в доступе' : 'Демо: ошибка загрузки');
     this.assertGeneration(generation); const d = mockDataset(); await this.setUserScope(d.user, generation); this.assertGeneration(generation); const issues = scenario === 'empty' ? [] : d.issues.filter(i => i.assignedTo?.id === d.user.id), catalog: Catalog = { projects: d.projects, statuses: d.statuses, trackers: d.trackers, priorities: d.priorities, categories: d.categories, warnings: [] };
-    return { rows: issues.map(issue => ({ issue, launches: [] })), total: issues.length, catalog, filters: { ...this.filters }, fetchedAt: now(), incomplete: false, user: d.user, contextGeneration: this.contextGeneration };
+    return { rows: issues.map(issue => ({ issue, sessions: [], launches: [] })), total: issues.length, catalog, filters: { ...this.filters }, fetchedAt: now(), incomplete: false, user: d.user, contextGeneration: this.contextGeneration };
   }
   private async realList(generation: number, filterOverride?: Partial<Filters>): Promise<ListResult> {
     const ctx = await this.requestContext(generation); const get = (path: string) => this.getJson(path, ctx);
@@ -312,7 +312,7 @@ export class PluginService {
     }
     catalog.trackers = [...trackerById.values()].sort((a, b) => a.id - b.id);
     this.assertGeneration(generation);
-    return { rows: issues.map(issue => ({ issue, launches: [] })), total: itotal, catalog, filters: { ...this.filters }, fetchedAt: now(), incomplete, user, contextGeneration: this.contextGeneration };
+    return { rows: issues.map(issue => ({ issue, sessions: [], launches: [] })), total: itotal, catalog, filters: { ...this.filters }, fetchedAt: now(), incomplete, user, contextGeneration: this.contextGeneration };
   }
   private applyFilters(base: ListResult): ListResult {
     const search = this.filters.search.trim(), exactId = search.startsWith('#') ? search.slice(1).trim() : undefined;
@@ -336,14 +336,42 @@ export class PluginService {
     }
   }
   private async attachLocalMetadata(result: ListResult): Promise<ListResult> {
-    const perIssue = await this.o.store.get<Record<string, string>>(`redmine.scope.${this.ns}.issueWorkspaces`, {});
-    const perProject = await this.o.store.get<Record<string, string>>(`redmine.scope.${this.ns}.projectWorkspaces`, {});
-    const rows = await Promise.all(result.rows.map(async r => {
+    const generation = this.generation, contextGeneration = this.contextGeneration, scope = this.ns;
+    if (result.contextGeneration !== contextGeneration) throw new Error('Issue list context changed; refresh the list');
+    const perIssue = await this.o.store.get<Record<string, string>>(`redmine.scope.${scope}.issueWorkspaces`, {});
+    this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    const perProject = await this.o.store.get<Record<string, string>>(`redmine.scope.${scope}.projectWorkspaces`, {});
+    this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    const rowsWithMetadata = await Promise.all(result.rows.map(async r => {
       const workspaceId = perIssue[String(r.issue.id)] ?? perProject[String(r.issue.project.id)]; let workspace: Workspace | undefined;
       if (workspaceId) try { workspace = await this.o.dsh.validate(workspaceId); } catch { /* deleted workspace is presented as unselected */ }
-      const launches = await this.o.store.get<Launch[]>(`redmine.scope.${this.ns}.issueLaunches.${r.issue.id}`, []);
-      return { ...r, ...(workspace ? { workspace } : {}), launches };
+      this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      const launchRecords = await this.o.store.get<Launch[]>(`redmine.scope.${scope}.issueLaunches.${r.issue.id}`, []);
+      this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+      const launches = launchRecords.filter(item => item.issueId === r.issue.id && typeof item.sessionId === 'string' && item.sessionId.length > 0);
+      return { row: r, workspace, launches };
     }));
+    const candidateSessionIds = [...new Set(rowsWithMetadata.flatMap(entry => entry.launches.map(item => item.sessionId)))];
+    let availableSessionIds = new Set<string>();
+    let sessionSyncWarning = false;
+    if (candidateSessionIds.length) {
+      try { availableSessionIds = new Set(await this.o.dsh.existingSessions(candidateSessionIds)); }
+      catch { sessionSyncWarning = true; await this.log('warning', 'sessions', 'Could not synchronize available DSH sessions'); }
+      this.assertGeneration(generation); this.assertContextGeneration(contextGeneration);
+    }
+    const rows = rowsWithMetadata.map(({ row, workspace, launches: launchRecords }) => {
+      const latestBySession = new Map<string, Launch>();
+      for (const item of launchRecords) {
+        if (!availableSessionIds.has(item.sessionId) || item.planModePresetMismatch) continue;
+        const previous = latestBySession.get(item.sessionId);
+        if (!previous || item.createdAt > previous.createdAt) latestBySession.set(item.sessionId, item);
+      }
+      const sessions = [...latestBySession.values()].sort((a, b) => (b.sessionCreatedAt ?? b.createdAt).localeCompare(a.sessionCreatedAt ?? a.createdAt));
+      const launches = launchRecords.filter(item =>
+        item.status === 'failed' || item.status === 'creating' || item.status === 'sending',
+      ).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      return { ...row, ...(workspace ? { workspace } : {}), sessions, launches, ...(sessionSyncWarning ? { sessionSyncWarning: true } : {}) };
+    });
     return { ...result, rows };
   }
   private async issueSessions(issueId: number, expectedContextGeneration: number): Promise<{ sessions: Launch[]; confirmationToken: string }> {

@@ -136,6 +136,7 @@ export function RedminePanel({ api }: PanelProps) {
   const [stateReady, setStateReady] = useState(false);
   const [refreshSeq, setRefreshSeq] = useState(0);
   const [error, setError] = useState('');
+  const [launchError, setLaunchError] = useState('');
   const [notice, setNotice] = useState('');
   const [workspaceIssue, setWorkspaceIssue] = useState<Issue>();
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
@@ -179,6 +180,7 @@ export function RedminePanel({ api }: PanelProps) {
       if (sourceChanged) {
         advanceEpoch(launchPreflightEpoch);
         setResult(undefined);
+        setLaunchError('');
         setFilters(saved.filters ?? { ...DEFAULT_FILTERS });
         setLaunchConfirmation(undefined);
         launchChoiceClaimed.current = false;
@@ -308,26 +310,26 @@ export function RedminePanel({ api }: PanelProps) {
       const templateId = remote?.settings.templates.some(template => template.id === launchTemplateId) ? launchTemplateId : remote?.settings.defaultTemplateId;
       const started = await api.call('launch', { issueId: row.issue.id, operationId, ...(templateId ? { templateId } : {}), ...(confirmationToken ? { confirmationToken } : {}), ...(existingSessionId ? { existingSessionId } : {}) });
       if (!isCurrent()) return;
-      setResult(current => current ? ({ ...current, rows: current.rows.map(r => r.issue.id === row.issue.id ? { ...r, launches: [started, ...r.launches.filter(x => x.operationId !== started.operationId)] } : r) }) : current);
-      if (started.status === 'failed') { setError(started.error || 'Не удалось запустить сессию. Повторите попытку.'); clientEvent('error', 'launch'); return; }
+      setRefreshSeq(current => current + 1);
+      if (started.status === 'failed') { setLaunchError(started.error || 'Не удалось запустить сессию. Повторите попытку.'); clientEvent('error', 'launch'); return; }
       const sentNotice = started.reusedSession ? 'Промпт отправлен в существующую сессию.' : 'Промпт отправлен в новую сессию.';
       setNotice(started.status === 'sent' ? sentNotice : 'Сессия создана. Проверяем доступность…');
       if (started.reusedSession || remote?.settings.openCreatedSession !== false) await openSession(started, isCurrent);
     } catch (e) {
       if (!isCurrent()) return;
-      setError(`${errText(e)} Повторите отправку из истории запусков, если операция была сохранена.`); clientEvent('error', 'launch');
-      try { const refreshed = await api.call('list', { filters }); if (isCurrent()) setResult(refreshed); } catch { /* the existing issue list remains visible */ }
+      setLaunchError(`${errText(e)} Повторите отправку из истории запусков, если операция была сохранена.`); clientEvent('error', 'launch');
+      setRefreshSeq(current => current + 1);
     }
   };
   const launch = async (row: Row, retryOperationId?: string) => {
-    if ((!row.workspace?.available && !row.launches.length) || launchBusy !== null) return;
+    if ((!row.workspace?.available && !row.sessions.length && !row.launches.length) || launchBusy !== null) return;
     const epoch = advanceEpoch(launchPreflightEpoch);
     const isCurrent = () => isCurrentEpoch(launchPreflightEpoch, epoch);
     launchChoiceClaimed.current = false;
     launchConfirmationStarting.current = false;
     setLaunchConfirmationBusy(false);
     setLaunchConfirmationAction(null);
-    setLaunchBusy(row.issue.id); setError(''); setNotice('');
+    setLaunchBusy(row.issue.id); setError(''); setLaunchError(''); setNotice('');
     let waitingForChoice = false;
     try {
       if (retryOperationId) {
@@ -347,7 +349,7 @@ export function RedminePanel({ api }: PanelProps) {
       await executeLaunch(row, undefined, confirmationToken, isCurrent);
     } catch (e) {
       if (!isCurrent()) return;
-      setError(`Не удалось проверить существующие сессии: ${errText(e)}. Повторите попытку.`);
+      setLaunchError(`Не удалось проверить существующие сессии: ${errText(e)}. Повторите попытку.`);
       clientEvent('error', 'issueSessions');
     } finally {
       if (isCurrent() && !waitingForChoice) setLaunchBusy(null);
@@ -420,6 +422,7 @@ export function RedminePanel({ api }: PanelProps) {
     {scenarioError && <div className="rm-error" role="alert">Не удалось сохранить сценарий: {scenarioError}<button onClick={() => setScenarioError('')} aria-label="Скрыть ошибку">×</button></div>}
     {notice && <div className="rm-notice" role="status">{notice}<button onClick={() => setNotice('')} aria-label="Скрыть">×</button></div>}
     {error && <div className="rm-error" role="alert" tabIndex={-1}>{error}<button onClick={() => setError('')} aria-label="Скрыть ошибку">×</button></div>}
+    {launchError && <div className="rm-error" role="alert" tabIndex={-1}>{launchError}<button onClick={() => setLaunchError('')} aria-label="Скрыть ошибку запуска">×</button></div>}
     {result?.incomplete && <p className="rm-warning">Данные могут быть неполными. Проверьте предупреждения ниже.</p>}
     {catalog?.warnings?.length ? <details className="rm-warnings"><summary>Ограничения справочников ({catalog.warnings.length})</summary><ul>{catalog.warnings.map((warning, i) => <li key={i}>{warning}</li>)}</ul></details> : null}
     <section className="rm-filters" aria-label="Фильтры задач">
@@ -438,7 +441,7 @@ export function RedminePanel({ api }: PanelProps) {
     {!busy && result && !result.rows.length && <div className="rm-empty"><span aria-hidden="true">⌕</span><strong>Задачи не найдены</strong><p>Измените фильтры или обновите список.</p><button className="rm-secondary" onClick={() => setFilters({ ...DEFAULT_FILTERS })}>Сбросить фильтры</button></div>}
     {result && <div className={busy || error ? 'rm-issue-list rm-stale' : 'rm-issue-list'} aria-busy={busy}>
       {(busy || error) && <div className="rm-stale-label">{error ? 'Показаны ранее загруженные данные' : 'Обновление; показаны предыдущие данные'}</div>}
-      {result.rows.map(row => <IssueCard key={row.issue.id} row={row} busy={launchBusy === row.issue.id} globalLaunchBusy={launchBusy !== null} canLaunch={!!row.workspace?.available || row.launches.length > 0} onWorkspace={() => void openWorkspace(row.issue)} onLaunch={operationId => void launch(row, operationId)} onOpenSession={openSession} />)}
+      {result.rows.map(row => <IssueCard key={row.issue.id} row={row} busy={launchBusy === row.issue.id} globalLaunchBusy={launchBusy !== null} canLaunch={!!row.workspace?.available || row.sessions.length > 0 || row.launches.length > 0} onWorkspace={() => void openWorkspace(row.issue)} onLaunch={operationId => void launch(row, operationId)} onOpenSession={openSession} />)}
     </div>}
     {result && <nav className="rm-pagination" aria-label="Страницы задач"><span>Страница {filters.page} из {pages}</span><div><button className="rm-secondary" disabled={filters.page <= 1 || busy} onClick={() => updateFilter('page', filters.page - 1, false)}>Назад</button><button className="rm-secondary" disabled={filters.page >= pages || busy} onClick={() => updateFilter('page', filters.page + 1, false)}>Далее</button></div></nav>}
     {launchConfirmation && <dialog ref={launchConfirmationDialog} className="rm-dialog" aria-modal="true" aria-labelledby="launch-confirm-title" onCancel={event => { event.preventDefault(); cancelLaunchConfirmation(); }}><div className="rm-dialog-card"><div className="rm-dialog-header"><div><h2 id="launch-confirm-title">У этой задачи уже есть сессии</h2><p>Задача #{launchConfirmation.row.issue.id}</p></div><button className="rm-icon-button" type="button" onClick={cancelLaunchConfirmation} aria-label="Закрыть" disabled={launchConfirmationBusy}>×</button></div>
@@ -470,11 +473,16 @@ function IssueCard({ row, busy, globalLaunchBusy, canLaunch, onWorkspace, onLaun
     <div className="rm-issue-bottom"><div className={row.workspace?.available ? 'rm-workspace' : 'rm-workspace missing'}><span aria-hidden="true">▰</span><span title={row.workspace?.path}>{row.workspace ? `${row.workspace.name} · ${shortPath(row.workspace.path)}` : 'Workspace не выбран'}</span></div>
       <div className="rm-card-actions">{issueUrl ? <a className="rm-subtle-link" href={issueUrl} target="_blank" rel="noreferrer">В Redmine ↗</a> : <span className="rm-subtle-link" aria-label="Ссылка недоступна">Ссылка недоступна</span>}<button className="rm-secondary" onClick={onWorkspace}>{row.workspace ? 'Изменить workspace' : 'Выбрать workspace'}</button><button className="rm-primary" disabled={!canLaunch || busy} title={!canLaunch ? 'Сначала выберите доступный workspace' : undefined} onClick={() => onLaunch()}>{busy ? 'Запуск…' : 'В работу'}</button></div>
     </div>
-    {!!row.launches.length && <div className="rm-launch-history"><span>Сессии</span>{row.launches.map(item => {
-      const retryable = !item.retryBlocked && (item.status === 'failed' || item.status === 'sending' || item.status === 'creating');
+    {row.sessionSyncWarning && <p className="rm-warning" role="status">Не удалось обновить список сессий DSH.</p>}
+    {!!row.sessions.length && <div className="rm-launch-history"><span>Сессии</span>{row.sessions.map(item =>
+      <span className="rm-launch-item" key={item.sessionId}><span className="rm-launch-state sent">Доступна</span><time>{fmtDate(item.sessionCreatedAt ?? item.createdAt)}</time><button className="rm-link-button" onClick={() => void onOpenSession(item)}>Открыть сессию</button></span>
+    )}</div>}
+    {!!row.launches.length && <div className="rm-launch-history"><span>Попытки запуска</span>{row.launches.map(item => {
+      const retryable = !item.retryBlocked && !item.planModePresetMismatch && (item.status === 'failed' || item.status === 'sending' || item.status === 'creating');
       const sameWorkspace = row.workspace?.id === item.workspaceId;
       const workspaceMatchesRetry = item.reusedSession || sameWorkspace;
-      return <span className="rm-launch-item" key={item.operationId}><span className={`rm-launch-state ${item.status}`}>{item.status === 'sent' ? 'Отправлено' : item.status === 'failed' ? 'Ошибка' : 'Создаётся'}</span><time>{fmtDate(item.createdAt)}</time>{item.error && <span className="rm-launch-error">{item.error}</span>}{retryable && <><button className="rm-secondary" disabled={globalLaunchBusy || !canLaunch || !workspaceMatchesRetry} title={!workspaceMatchesRetry ? 'Выберите workspace, использованный в исходной попытке' : !canLaunch ? 'Исходный workspace недоступен' : undefined} onClick={() => onLaunch(item.operationId)}>Повторить отправку</button>{!workspaceMatchesRetry && <span className="rm-launch-error" role="status">Для повтора выберите workspace, использованный в этой попытке.</span>}</>}<button className="rm-link-button" onClick={() => void onOpenSession(item)}>Открыть сессию</button></span>;
+      const launchStatus = item.status === 'failed' ? 'Ошибка' : item.status === 'sending' ? 'Отправляется' : 'Создаётся';
+      return <span className="rm-launch-item" key={item.operationId}><span className={`rm-launch-state ${item.status}`}>{launchStatus}</span><time>{fmtDate(item.createdAt)}</time>{item.error && <span className="rm-launch-error">{item.error}</span>}{retryable && <><button className="rm-secondary" disabled={globalLaunchBusy || !canLaunch || !workspaceMatchesRetry} title={!workspaceMatchesRetry ? 'Выберите workspace, использованный в исходной попытке' : !canLaunch ? 'Исходный workspace недоступен' : undefined} onClick={() => onLaunch(item.operationId)}>Повторить отправку</button>{!workspaceMatchesRetry && <span className="rm-launch-error" role="status">Для повтора выберите workspace, использованный в этой попытке.</span>}</>}</span>;
     })}</div>}
   </article>;
 }
