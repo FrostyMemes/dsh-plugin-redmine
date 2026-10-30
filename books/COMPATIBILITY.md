@@ -2,16 +2,19 @@
 
 ## Целевая DSH
 
-Исследован установленный `E:/Programming/tools/DSH/resources/app.asar`: Desktop `0.2.1-rc.3` и соответствующие manifests/README/runtime реализации пакетов DSH. Подтверждены:
+Исследован установленный `E:/Programming/tools/DSH/resources/app.asar`: Desktop `0.2.1-rc.5` (FileVersion `0.2.1-rc.5`) и соответствующие manifests/README/runtime реализации пакетов DSH. Проверены вызовы, используемые плагином; их формы присутствуют в установленной сборке:
 
 - `TypertRemoteService`, `@Remote`, owner principal, ручные согласованные Host/Client descriptors;
 - глобальные `sidebar.panellist` и `main`, `layout.selectPanel`, настройки Bundle `plugins.bundle.config`;
-- `workspaceRegistry.create/list/get`, каноническое переиспользование существующего каталога;
-- `uiWorkspace.pickDirectory/openSession`, `sessionController.create({workspaceId,sessionId})` и `prompt` с idempotent `requestId`;
+- `workspaceRegistry.create/list/get` и `archivedSessionIds`;
+- `uiWorkspace.pickDirectory/openSession`, `sessionController.list` со списком `items` и полем `sessionId`, `create({workspaceId,sessionId,agentPreset})`, `prompt` с idempotent `requestId`, `rename` и `resolveAgent`;
+- `agentPresets.defaultId/resolve/compositionInventory/serviceFor` и сервис `planMode`;
 - DSH credentials и durable schema-validated storage-domain;
 - `ctx.logger.exporter` для нативных ошибок Cordis и переопределение каталога данных через `DSH_HOME`.
 
-До передачи пользователем браузерной проверки на свою сторону Bundle был установлен и активирован в изолированном Web-профиле `redmine-dev`; Host напечатал адрес без предупреждений активации. Это не подтверждение клиентской загрузки, навигации, внешнего вида или полного запуска сессии. Изолированный профиль не содержит пользовательских ключей и MCP.
+Пакеты DSH, от которых зависят эти интерфейсы, в установленном приложении имеют версию `0.2.1-rc.5`; Cordis остаётся `4.0.5`. Проект собран на SDK `rc.5`; `npm test` завершился успешно: TypeScript/Bundle без ошибок, 51 тест прошёл. Это проверяет интеграционные типы и регрессии, но не подтверждает загрузку плагина в установленном Desktop, UI или полный запуск сессии.
+
+До обновления DSH Bundle был установлен в изолированном Web-профиле `redmine-dev`; эта более ранняя проверка не подтверждает активацию на `rc.5`. Host напечатал адрес без предупреждений активации, но это не подтверждение клиентской загрузки, навигации, внешнего вида или полного запуска сессии. Изолированный профиль не содержит пользовательских ключей и MCP.
 
 ## Redmine
 
@@ -51,7 +54,7 @@
 
 ## Ограничения
 
-- Новые версии DSH не заявлены совместимыми: manifest фиксирует проверенный целевой SDK.
+- Manifest фиксирует точную целевую версию DSH `0.2.1-rc.5`; совместимость с другими prerelease/release версиями не заявлена.
 - Поиск/сложные фильтры могут требовать загрузки метаданных нескольких страниц на Host. Предел — 10 000 задач с явной индикацией неполноты.
 - Запуск сессии может принять промпт, но дальнейшее выполнение агента зависит от модели, учётных данных и разрешений DSH.
 - Runtime-журнал фильтрует нативные записи по Redmine. Ошибки загрузки, препятствующие активации Bundle, остаются в штатной диагностике DSH.
