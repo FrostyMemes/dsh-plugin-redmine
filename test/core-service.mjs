@@ -5,16 +5,29 @@ import { PluginService } from '../dist/core/service.js';
 const store = () => { const values = new Map(); return { values, async get(k, fallback) { return values.has(k) ? values.get(k) : fallback; }, async set(k,v) { values.set(k,v); } }; };
 const harness = (options = {}) => {
   const db = options.db ?? store(), sends = [], sessions = new Set(), calls = [], renames = [], creds = { key: undefined, async resolve(){ return this.key; }, async set(v){ this.key=v; }, async clear(){ this.key=undefined; } };
-  const dsh = { async list(){ return [{id:'w1',name:'Workspace',path:'C:/work',available:true}]; }, async register(path){ return {id:'w1',name:'Workspace',path,available:true}; }, async validate(id){ if(id!=='w1') throw Error('missing'); return {id:'w1',name:'Workspace',path:'C:/work',available:true}; }, async createSession(w,s){ calls.push(['create',w,s]); sessions.add(s); }, async sendPrompt(s,r,p){ calls.push(['send',s,r]); sends.push(p); }, async renameSession(s,t){ calls.push(['rename',s,t]); renames.push({sessionId:s,title:t}); }, async sessionExists(s){ return sessions.has(s); } };
+  let planModePresetFailures = options.planModePresetFailures ?? 0, planModeEnableFailures = options.planModeEnableFailures ?? 0;
+  const dsh = { async list(){ return [{id:'w1',name:'Workspace',path:'C:/work',available:true}]; }, async register(path){ return {id:'w1',name:'Workspace',path,available:true}; }, async validate(id){ if(id!=='w1') throw Error('missing'); return {id:'w1',name:'Workspace',path:'C:/work',available:true}; }, async createSession(w,s,preset){ calls.push(['create',w,s,preset]); sessions.add(s); }, async planModePreset(){ calls.push(['plan-preflight']); if(planModePresetFailures-->0) throw Error('Plan mode unavailable'); return options.agentPreset ?? 'default-preset'; }, async enablePlanMode(s){ calls.push(['plan-mode',s]); if(planModeEnableFailures-->0) throw Error('Plan mode set failed'); }, async sendPrompt(s,r,p){ calls.push(['send',s,r]); sends.push(p); }, async renameSession(s,t){ calls.push(['rename',s,t]); renames.push({sessionId:s,title:t}); }, async sessionExists(s){ return sessions.has(s); }, async existingSessions(ids){ calls.push(['existingSessions', [...ids]]); return [...new Set(ids)].filter(id=>sessions.has(id)); } };
   return { db, sends, sessions, calls, renames, creds, dsh, async service(opts={}) { return PluginService.create({store:db,credentials:creds,dsh,logDirectory:'unused',fetch:opts.fetch}); } };
 };
 const json = (obj, status=200) => new Response(JSON.stringify(obj), {status, headers:{'content-type':'application/json'}});
+const launchFromPreflight = async (service, issueId, operationId, expectedContextGeneration) => {
+  const { confirmationToken } = await service.call('issueSessions', { issueId, expectedContextGeneration });
+  return service.call('launch', { issueId, operationId, confirmationToken });
+};
 
 test('mock default makes no network requests and returns broad deterministic metadata', async () => {
   let count=0; const h=harness(), s=await h.service({fetch:async()=>{count++; throw Error('network');}});
   const result=await s.call('list',{});
   assert.equal(count,0); assert.equal(result.catalog.projects.length,130); assert.ok(result.total>=120); assert.ok(result.rows.every(r=>!('description' in r.issue)));
   assert.equal(result.filters.statuses[0],'open'); assert.ok(result.catalog.categories.some(c=>c.name==='Общее'));
+});
+
+test('plan-mode launch preference defaults off and persists across Host service reload', async () => {
+  const h=harness(), first=await h.service();
+  assert.equal((await first.call('state',{})).settings.launchInPlanMode,false);
+  await first.call('configure',{launchInPlanMode:true});
+  const second=await h.service();
+  assert.equal((await second.call('state',{})).settings.launchInPlanMode,true);
 });
 
 test('real Redmine uses GET, API key header, paginates old REST responses, and excludes issue body', async () => {
@@ -61,6 +74,14 @@ test('healthcheck distinguishes forbidden and mock health does not claim a real 
   const h=harness(), s=await h.service({fetch:async()=>json({},403)}); const mock=await s.call('check',{}); assert.equal(mock.mock,true); assert.equal(mock.status,'warning');
   await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine.example',apiKey:'secret'});
   const bad=await s.call('check',{}); assert.equal(bad.status,'error'); assert.ok(bad.steps.some(x=>x.httpStatus===403)); assert.match(bad.steps.find(x=>x.httpStatus===403).message,/прав/);
+});
+
+test('clearing health removes stored results until the next check', async () => {
+  const h=harness(), s=await h.service();
+  assert.ok((await s.call('check',{})).steps.length);
+  const cleared=await s.call('clearHealth',{});
+  assert.equal(cleared.health,undefined); assert.equal(h.db.values.get('redmine.health'),undefined);
+  const reloaded=await h.service(); assert.equal((await reloaded.call('state',{})).health,undefined);
 });
 
 test('healthcheck validates categories and trackers through project details and reports sample scope', async () => {
@@ -134,19 +155,243 @@ test('partial project details are retried on refresh so trackers can recover', a
 test('launch retries reuse a session and request ID; duplicate operation is one session', async () => {
   const h=harness(); const s=await h.service(); const data=await s.call('list',{}); await s.call('selectWorkspace',{issueId:data.rows[0].issue.id,workspaceId:'w1',rememberProject:true});
   let fail=true; h.dsh.sendPrompt=async (session,request,prompt)=>{ h.calls.push(['send',session,request]); if(fail){fail=false; throw Error('temporary failure');} h.sends.push(prompt); };
-  const op='stable-op'; await assert.rejects(s.call('launch',{issueId:data.rows[0].issue.id,operationId:op}), e=>e.sessionId==='redmine-stable-op');
+  const op='stable-op'; await assert.rejects(launchFromPreflight(s,data.rows[0].issue.id,op,data.contextGeneration), e=>e.sessionId==='redmine-stable-op');
   const complete=await s.call('launch',{issueId:data.rows[0].issue.id,operationId:op}); const duplicate=await s.call('launch',{issueId:data.rows[0].issue.id,operationId:op});
-  assert.equal(complete.sessionId,duplicate.sessionId); assert.equal(h.calls.filter(x=>x[0]==='create').length,1); assert.equal(h.calls.filter(x=>x[0]==='rename').length,1); assert.equal(h.calls.filter(x=>x[0]==='send').length,2); assert.deepEqual(h.calls.map(x=>x[0]),['create','rename','send','send']); assert.equal(h.renames[0].title,data.rows[0].issue.subject); assert.equal(complete.sessionTitle,data.rows[0].issue.subject); assert.equal(complete.titleApplied,true); assert.match(h.sends[0],/демонстрационный запуск/i); assert.match(h.sends[0],/Не вызывай Redmine, MCP или сеть/i); assert.doesNotMatch(h.sends[0],/redmine\.invalid|10000/);
+  assert.equal(complete.sessionId,duplicate.sessionId); assert.equal(h.calls.filter(x=>x[0]==='create').length,1); assert.equal(h.calls.filter(x=>x[0]==='rename').length,1); assert.equal(h.calls.filter(x=>x[0]==='send').length,2); assert.deepEqual(h.calls.filter(x=>x[0]!=='existingSessions').map(x=>x[0]),['create','rename','send','send']); assert.equal(h.renames[0].title,data.rows[0].issue.subject); assert.equal(complete.sessionTitle,data.rows[0].issue.subject); assert.equal(complete.titleApplied,true); assert.match(h.sends[0],/демонстрационный запуск/i); assert.match(h.sends[0],/Не вызывай Redmine, MCP или сеть/i); assert.doesNotMatch(h.sends[0],/redmine\.invalid|10000/);
+});
+
+test('legacy uncertain launch without a prompt snapshot is blocked and points to a new operation', async () => {
+  const h=harness(), s=await h.service(), data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  const sent=await launchFromPreflight(s,issueId,'legacy-operation',data.contextGeneration);
+  const legacy={...sent,status:'failed',error:'previous version failure'};
+  delete legacy.promptSnapshotVersion; delete legacy.templateId;
+  h.db.values.set(`redmine.scope.mock:user:7.launch.legacy-operation`,legacy);
+  h.db.values.set(`redmine.scope.mock:user:7.issueLaunches.${issueId}`,[legacy]);
+  const sendsBefore=h.sends.length, createsBefore=h.calls.filter(call=>call[0]==='create').length;
+  const blocked=await s.call('launch',{issueId,operationId:'legacy-operation'});
+  assert.equal(blocked.retryBlocked,true); assert.equal(blocked.status,'failed'); assert.match(blocked.error,/«В работу».*новую операцию/);
+  assert.equal(h.sends.length,sendsBefore); assert.equal(h.calls.filter(call=>call[0]==='create').length,createsBefore);
+  assert.equal(h.db.values.get(`redmine.scope.mock:user:7.issueLaunches.${issueId}`)[0].retryBlocked,true);
+});
+
+test('plan-mode launch snapshots the default preset and enables the mode before any prompt, including retry', async () => {
+  const h=harness({agentPreset:'planning'}), s=await h.service();
+  await s.call('configure',{launchInPlanMode:true});
+  const data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  h.dsh.enablePlanMode=async session=>{ h.calls.push(['plan-mode',session]); if(h.calls.filter(x=>x[0]==='plan-mode').length===1) throw Error('temporary plan service failure'); };
+  const operationId='plan-mode-retry';
+  await assert.rejects(launchFromPreflight(s,issueId,operationId,data.contextGeneration),/temporary plan service failure/);
+  const saved=h.db.values.get(`redmine.scope.mock:user:7.launch.${operationId}`);
+  assert.equal(saved.planModeOnLaunch,true); assert.equal(saved.agentPreset,'planning');
+  assert.equal(h.calls.filter(x=>x[0]==='send').length,0);
+  assert.deepEqual(h.calls.find(x=>x[0]==='create'),['create','w1',`redmine-${operationId}`,'planning']);
+  await s.call('configure',{launchInPlanMode:false});
+  const complete=await s.call('launch',{issueId,operationId});
+  const steps=h.calls.map(x=>x[0]);
+  assert.equal(complete.status,'sent'); assert.equal(complete.planModeOnLaunch,true);
+  assert.equal(steps.filter(x=>x==='create').length,1); assert.equal(steps.filter(x=>x==='plan-preflight').length,1);
+  assert.equal(steps.filter(x=>x==='plan-mode').length,2);
+  assert.ok(steps.lastIndexOf('plan-mode') < steps.indexOf('send'));
+});
+
+test('plan-mode preflight failure does not create a session or send a prompt', async () => {
+  const h=harness({planModePresetFailures:1}), s=await h.service();
+  await s.call('configure',{launchInPlanMode:true});
+  const data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  await assert.rejects(launchFromPreflight(s,issueId,'plan-mode-unavailable',data.contextGeneration),/Plan mode unavailable/);
+  assert.equal(h.calls.filter(x=>x[0]==='create').length,0);
+  assert.equal(h.sessions.size,0); assert.equal(h.calls.filter(x=>x[0]==='send').length,0);
+});
+
+test('preset mismatch stays blocked on same-operation retry even when plan mode is available', async () => {
+  const h=harness({agentPreset:'expected-preset'}), s=await h.service();
+  await s.call('configure',{launchInPlanMode:true});
+  const data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  let createCalls=0, planModeCalls=0;
+  h.dsh.createSession=async (_workspaceId,sessionId)=>{
+    createCalls++; h.sessions.add(sessionId);
+    throw Object.assign(new Error('wrong preset returned'),{sessionId,planModePresetMismatch:true});
+  };
+  h.dsh.enablePlanMode=async sessionId=>{ planModeCalls++; h.calls.push(['plan-mode',sessionId]); };
+  const operationId='preset-mismatch-retry';
+  await assert.rejects(launchFromPreflight(s,issueId,operationId,data.contextGeneration),/wrong preset returned/);
+  const saved=h.db.values.get(`redmine.scope.mock:user:7.launch.${operationId}`);
+  assert.equal(saved.planModePresetMismatch,true);
+  await assert.rejects(s.call('launch',{issueId,operationId}),/different preset|другим preset/i);
+  assert.equal(createCalls,1); assert.equal(planModeCalls,0);
+  assert.equal(h.calls.filter(call=>call[0]==='send').length,0);
+  assert.equal(h.sessions.has(`redmine-${operationId}`),true);
+});
+
+test('issue session preflight returns only live sessions recorded for that loaded issue in one batch', async () => {
+  const h=harness(), s=await h.service(), data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  await launchFromPreflight(s,issueId,'first-session',data.contextGeneration);
+  await launchFromPreflight(s,issueId,'second-session',data.contextGeneration);
+  assert.deepEqual(data.rows[0].launches,[]); // the panel's list snapshot is stale
+  h.sessions.add('unrelated-session');
+  const before=h.calls.filter(call=>call[0]==='existingSessions').length;
+  const result=await s.call('issueSessions',{issueId,expectedContextGeneration:data.contextGeneration});
+  assert.deepEqual(result.sessions.map(item=>item.sessionId).sort(),['redmine-first-session','redmine-second-session']);
+  assert.ok(result.sessions.every(item=>item.issueId===issueId && item.status==='sent'));
+  assert.equal(typeof result.confirmationToken,'string');
+  assert.equal(h.calls.filter(call=>call[0]==='existingSessions').length,before+1);
+  await assert.rejects(s.call('issueSessions',{issueId:999999,expectedContextGeneration:data.contextGeneration}),/loaded metadata list/);
+});
+
+test('list rows show one latest launch per live DSH session and retain retries for unavailable sessions', async () => {
+  const h=harness(), s=await h.service(), data=await s.call('list',{});
+  const [issueA,issueB]=data.rows.slice(0,2).map(row=>row.issue.id);
+  const launch=(operationId,issueId,sessionId,status,createdAt)=>({operationId,issueId,workspaceId:'w1',sessionId,requestId:operationId,status,createdAt});
+  h.db.values.set(`redmine.scope.mock:user:7.issueLaunches.${issueA}`,[
+    launch('shared-old',issueA,'shared-session','sent','2026-01-01T00:00:00.000Z'),
+    launch('shared-latest',issueA,'shared-session','sent','2026-01-02T00:00:00.000Z'),
+    launch('deleted-session',issueA,'deleted-session','sent','2026-01-03T00:00:00.000Z'),
+    launch('archived-session',issueA,'archived-session','sent','2026-01-04T00:00:00.000Z'),
+    launch('retry-failed',issueA,'redmine-retry-failed','failed','2026-01-05T00:00:00.000Z'),
+    launch('retry-running',issueA,'redmine-retry-running','sending','2026-01-06T00:00:00.000Z'),
+    launch('failed-live-session',issueA,'live-failed-session','failed','2026-01-07T00:00:00.000Z'),
+    {...launch('preset-mismatch-live',issueA,'mismatch-session','failed','2026-01-08T00:00:00.000Z'),planModePresetMismatch:true},
+    launch('wrong-issue-record',issueB, 'wrong-issue-record','sent','2026-01-07T00:00:00.000Z'),
+  ]);
+  h.db.values.set(`redmine.scope.mock:user:7.issueLaunches.${issueB}`,[
+    launch('cold-persisted',issueB,'persisted-session','sent','2026-01-08T00:00:00.000Z'),
+  ]);
+  const sessionBatches=[];
+  h.dsh.existingSessions=async ids=>{ sessionBatches.push([...ids]); return ids.filter(id=>id==='shared-session'||id==='persisted-session'||id==='live-failed-session'||id==='mismatch-session'); };
+
+  const result=await s.call('list',{});
+  const rowA=result.rows.find(row=>row.issue.id===issueA), rowB=result.rows.find(row=>row.issue.id===issueB);
+  assert.equal(sessionBatches.length,1);
+  assert.equal(sessionBatches[0].filter(id=>id==='shared-session').length,1);
+  assert.equal(sessionBatches[0].includes('wrong-issue-record'),false);
+  assert.deepEqual(rowA.sessions.map(item=>item.operationId),['failed-live-session','shared-latest']);
+  assert.deepEqual(rowB.sessions.map(item=>item.operationId),['cold-persisted']);
+  assert.deepEqual(rowA.launches.map(item=>item.operationId),['preset-mismatch-live','failed-live-session','retry-running','retry-failed']);
+  assert.equal(rowA.sessions.some(item=>item.sessionId==='deleted-session'||item.sessionId==='archived-session'||item.sessionId==='mismatch-session'),false);
+});
+
+test('session batch failures leave tasks visible and show only a generic sync warning', async () => {
+  const h=harness(), s=await h.service(), issueId=(await s.call('list',{})).rows[0].issue.id;
+  h.db.values.set(`redmine.scope.mock:user:7.issueLaunches.${issueId}`,[
+    {operationId:'live-session',issueId,workspaceId:'w1',sessionId:'linked-session',requestId:'live-session',status:'sent',createdAt:'2026-01-01T00:00:00.000Z'},
+  ]);
+  h.dsh.existingSessions=async()=>{ throw Error('sensitive lower-level details'); };
+  const result=await s.call('list',{}), row=result.rows.find(item=>item.issue.id===issueId);
+  assert.ok(row);
+  assert.equal(row.sessionSyncWarning,true);
+  assert.deepEqual(row.sessions,[]);
+  assert.doesNotMatch(JSON.stringify(result),/sensitive lower-level details/);
+});
+
+test('choosing an existing issue session sends the selected template to that same session without creating or renaming', async () => {
+  const h=harness();
+  const fetch=async url => {
+    const path=new URL(url).pathname.split('/').at(-1);
+    if(path==='current.json') return json({user:{id:5,login:'ada',firstname:'Ada',lastname:'Lovelace'}});
+    if(path==='projects.json') return json({projects:[{id:1,name:'Project'}],total_count:1});
+    if(path==='issues.json') return json({issues:[{id:31,subject:'Selected issue',project:{id:1,name:'Project'},status:{id:2,name:'In progress',is_closed:false},assigned_to:{id:5,name:'Ada Lovelace'},updated_on:'2026-10-27'}],total_count:1});
+    if(path==='issue_statuses.json') return json({issue_statuses:[{id:2,name:'In progress',is_closed:false}]});
+    if(path==='issue_priorities.json') return json({issue_priorities:[]});
+    if(path==='1.json') return json({project:{id:1,trackers:[{id:3,name:'Task'}],issue_categories:[]}});
+    throw Error(path);
+  };
+  const s=await h.service({fetch});
+  await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine.example',apiKey:'key',templates:[{id:'selected',name:'Selected',text:'Work on #{{issue.id}} {{issue.subject}} in {{workspace.path}}'}],defaultTemplateId:'selected'});
+  const data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  const original=await launchFromPreflight(s,issueId,'original-session',data.contextGeneration);
+  assert.equal(h.sends[0],'Work on #31 "Selected issue" in "C:/work"');
+  const {sessions,confirmationToken}=await s.call('issueSessions',{issueId,expectedContextGeneration:data.contextGeneration});
+  assert.deepEqual(sessions.map(item=>item.sessionId),[original.sessionId]);
+  const attemptedPrompts=[]; let failFirstReuse=true;
+  h.dsh.sendPrompt=async (session,request,prompt)=>{ h.calls.push(['send',session,request]); attemptedPrompts.push(prompt); if(failFirstReuse){failFirstReuse=false; throw Error('temporary failure');} h.sends.push(prompt); };
+  const reuseInput={issueId,operationId:'existing-session-prompt',templateId:'selected',confirmationToken,existingSessionId:original.sessionId};
+  await assert.rejects(s.call('launch',reuseInput),/temporary failure/);
+  await s.call('configure',{templates:[{id:'selected',name:'Selected',text:'Changed template for #{{issue.id}}'}],defaultTemplateId:'selected'});
+  const reused=await s.call('launch',{issueId,operationId:reuseInput.operationId,existingSessionId:original.sessionId});
+  assert.equal(reused.status,'sent'); assert.equal(reused.reusedSession,true); assert.equal(reused.sessionId,original.sessionId); assert.equal(reused.sessionCreatedAt,original.createdAt);
+  assert.deepEqual(h.calls.filter(call=>call[0]==='send').at(-1),['send',original.sessionId,'existing-session-prompt']);
+  assert.equal(h.calls.filter(call=>call[0]==='create').length,1); assert.equal(h.calls.filter(call=>call[0]==='rename').length,1);
+  assert.equal(h.calls.filter(call=>call[0]==='send').length,3); assert.equal(h.sends[1],'Work on #31 "Selected issue" in "C:/work"');
+  assert.deepEqual(attemptedPrompts,[h.sends[1],h.sends[1]]);
+});
+
+test('existing-session send rejects an ID outside its one-shot preflight snapshot', async () => {
+  const h=harness(), s=await h.service(), data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  const original=await launchFromPreflight(s,issueId,'session-to-reuse',data.contextGeneration);
+  const {confirmationToken}=await s.call('issueSessions',{issueId,expectedContextGeneration:data.contextGeneration});
+  await assert.rejects(s.call('launch',{issueId,operationId:'unrelated-session-send',confirmationToken,existingSessionId:'not-in-preflight'}),/confirmation is stale or expired/i);
+  assert.equal(h.calls.filter(call=>call[0]==='send').length,1);
+  assert.equal(h.calls.filter(call=>call[0]==='create').length,1);
+  assert.equal(original.status,'sent');
+});
+
+test('preflight token is rejected after a Redmine credential context change', async () => {
+  const h=harness(), s=await h.service(), data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  const { confirmationToken }=await s.call('issueSessions',{issueId,expectedContextGeneration:data.contextGeneration});
+  const before=(await s.call('state',{})).contextGeneration;
+  await s.call('configure',{apiKey:'replacement-key'});
+  const after=(await s.call('state',{})).contextGeneration;
+  assert.ok(after>before);
+  await assert.rejects(s.call('issueSessions',{issueId,expectedContextGeneration:data.contextGeneration}),/list context changed/i);
+  await assert.rejects(s.call('launch',{issueId,operationId:'stale-confirmation',confirmationToken}),/confirmation is stale or expired/i);
+  assert.equal(h.calls.filter(call=>call[0]==='create').length,0);
+});
+
+test('confirmation token stays revoked when the Redmine user scope changes A to B to A', async () => {
+  const h=harness(); let userId=5;
+  const fetch=async (url,init) => {
+    assert.equal(init.method,'GET');
+    const path=new URL(url).pathname.split('/').at(-1);
+    if(path==='current.json') return json({user:{id:userId,login:`user-${userId}`}});
+    if(path==='projects.json') return json({projects:[{id:1,name:'P'}],total_count:1});
+    if(path==='issues.json') return json({issues:[{id:3,subject:'Issue',project:{id:1,name:'P'},status:{id:2,name:'Open',is_closed:false},assigned_to:{id:userId,name:`User ${userId}`}}],total_count:1});
+    if(path==='issue_statuses.json') return json({issue_statuses:[{id:2,name:'Open',is_closed:false}]});
+    if(path==='issue_priorities.json') return json({issue_priorities:[]});
+    if(path==='1.json') return json({project:{id:1,trackers:[{id:4,name:'Task'}],issue_categories:[]}});
+    throw Error(path);
+  };
+  const s=await h.service({fetch});
+  await s.call('configure',{mockEnabled:false,baseUrl:'https://redmine.example',apiKey:'key'});
+  const load=()=>s.call('list',{refresh:true});
+  const userA=await load(); const issueId=userA.rows[0].issue.id;
+  const {confirmationToken}=await s.call('issueSessions',{issueId,expectedContextGeneration:userA.contextGeneration});
+  userId=6; const userB=await load();
+  userId=5; const userAAgain=await load();
+  assert.ok(userB.contextGeneration>userA.contextGeneration);
+  assert.ok(userAAgain.contextGeneration>userB.contextGeneration);
+  await assert.rejects(s.call('launch',{issueId,operationId:'revived-user-token',confirmationToken}),/confirmation is stale or expired/i);
+  assert.equal(h.calls.filter(call=>call[0]==='create').length,0);
+});
+
+test('one preflight token cannot authorize concurrent launches with different operation IDs', async () => {
+  const h=harness(), s=await h.service(), data=await s.call('list',{}), issueId=data.rows[0].issue.id;
+  await s.call('selectWorkspace',{issueId,workspaceId:'w1',rememberProject:true});
+  const { confirmationToken }=await s.call('issueSessions',{issueId,expectedContextGeneration:data.contextGeneration});
+  const results=await Promise.allSettled([
+    s.call('launch',{issueId,operationId:'one-shot-a',confirmationToken}),
+    s.call('launch',{issueId,operationId:'one-shot-b',confirmationToken}),
+  ]);
+  assert.equal(results.filter(result=>result.status==='fulfilled').length,1);
+  assert.equal(results.filter(result=>result.status==='rejected').length,1);
+  assert.equal(h.calls.filter(call=>call[0]==='create').length,1);
 });
 
 test('failed title operation is retried on the existing session before its prompt', async () => {
   const h=harness(); const s=await h.service(); const data=await s.call('list',{}); await s.call('selectWorkspace',{issueId:data.rows[0].issue.id,workspaceId:'w1',rememberProject:true});
   const title=data.rows[0].issue.subject; let fail=true;
   h.dsh.renameSession=async(session,requestedTitle)=>{ h.calls.push(['rename',session,requestedTitle]); h.renames.push({sessionId:session,title:requestedTitle}); if(fail){fail=false; throw Error('title service unavailable');} };
-  const op='title-retry'; await assert.rejects(s.call('launch',{issueId:data.rows[0].issue.id,operationId:op}), e=>e.sessionId==='redmine-title-retry');
+  const op='title-retry'; await assert.rejects(launchFromPreflight(s,data.rows[0].issue.id,op,data.contextGeneration), e=>e.sessionId==='redmine-title-retry');
   const stored=h.db.values.get(`redmine.scope.mock:user:7.launch.${op}`); assert.equal(stored.sessionId,'redmine-title-retry'); assert.equal(stored.status,'failed'); assert.equal(stored.titleApplied,undefined); assert.equal(stored.sessionTitle,title);
   const complete=await s.call('launch',{issueId:data.rows[0].issue.id,operationId:op});
-  assert.equal(complete.status,'sent'); assert.equal(complete.sessionId,'redmine-title-retry'); assert.equal(complete.titleApplied,true); assert.equal(h.calls.filter(x=>x[0]==='create').length,1); assert.equal(h.calls.filter(x=>x[0]==='rename').length,2); assert.equal(h.calls.filter(x=>x[0]==='send').length,1); assert.deepEqual(h.calls.map(x=>x[0]),['create','rename','rename','send']); assert.ok(h.calls.indexOf(h.calls.find(x=>x[0]==='rename'))<h.calls.findIndex(x=>x[0]==='send')); assert.deepEqual(h.renames.map(x=>x.title),[title,title]);
+  assert.equal(complete.status,'sent'); assert.equal(complete.sessionId,'redmine-title-retry'); assert.equal(complete.titleApplied,true); assert.equal(h.calls.filter(x=>x[0]==='create').length,1); assert.equal(h.calls.filter(x=>x[0]==='rename').length,2); assert.equal(h.calls.filter(x=>x[0]==='send').length,1); assert.deepEqual(h.calls.filter(x=>x[0]!=='existingSessions').map(x=>x[0]),['create','rename','rename','send']); assert.ok(h.calls.indexOf(h.calls.find(x=>x[0]==='rename'))<h.calls.findIndex(x=>x[0]==='send')); assert.deepEqual(h.renames.map(x=>x.title),[title,title]);
 });
 
 test('diagnostic records redact credential material and require developer mode', async () => {
