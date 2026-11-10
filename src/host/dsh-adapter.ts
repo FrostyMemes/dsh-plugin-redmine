@@ -1,7 +1,7 @@
 import { access, realpath, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { isAbsolute } from 'node:path';
-import type { SessionListValue, SessionRenameValue } from '@deepseek-ai/dsh-api-session-controller';
+import type { SessionListValue, SessionPromptRequest, SessionRenameValue } from '@deepseek-ai/dsh-api-session-controller';
 import type { DshAdapter, Workspace } from '../shared/contracts.js';
 
 interface Entity { id: string; title: string; path: string }
@@ -17,7 +17,7 @@ export interface HostServices {
   sessionController: {
     create(x: { workspaceId: string; sessionId: string; agentPreset?: string }): Promise<{ sessionId: string; agentPreset?: string }>;
     resolveAgent(sessionId: string): Promise<{ agent: { ctx: unknown } } | { error: unknown }>;
-    prompt(x: { sessionId: string; requestId: string; mode: 'followup'; content: { type: 'text'; text: string }[] }, signal: AbortSignal): Promise<unknown>;
+    prompt(x: { sessionId: string; requestId: string; mode: SessionPromptRequest['mode']; content: { type: 'text'; text: string }[] }, signal: AbortSignal): Promise<unknown>;
     list(x: {}, signal: AbortSignal): Promise<SessionListValue>;
     rename(x: { sessionId: string; title: string }): Promise<SessionRenameValue>;
   };
@@ -122,7 +122,7 @@ export function createDshAdapter(services: HostServices): DshAdapter {
         throw new Error('Не удалось включить режим планирования для созданной сессии DSH. Промпт не отправлен.');
       }
     },
-    async sendPrompt(sessionId, requestId, text) { await services.sessionController.prompt({ sessionId, requestId, mode: 'followup', content: [{ type: 'text', text }] }, new AbortController().signal); },
+    async sendPrompt(sessionId, requestId, text) { await services.sessionController.prompt({ sessionId, requestId, mode: 'queue', content: [{ type: 'text', text }] }, new AbortController().signal); },
     async renameSession(sessionId, title) { await services.sessionController.rename({ sessionId, title }); },
     async sessionExists(sessionId) {
       return (await existingSessions([sessionId])).includes(sessionId);
