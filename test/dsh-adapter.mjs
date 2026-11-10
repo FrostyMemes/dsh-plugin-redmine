@@ -2,6 +2,30 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDshAdapter } from '../dist/host/dsh-adapter.js';
 
+test('prompt adapter queues the original request and propagates DSH failures', async () => {
+  const failure = new Error('prompt rejected');
+  let observed;
+  const services = {
+    workspaceRegistry: { archivedSessionIds: [], list: () => [], get: () => undefined, create: async () => { throw Error('unused'); } },
+    sessionController: {
+      async create() { throw Error('unused'); },
+      async prompt(request, signal) { observed = { request, signal }; throw failure; },
+      async list() { return { items: [] }; },
+      async rename() { throw Error('unused'); },
+    },
+  };
+  const adapter = createDshAdapter(services);
+
+  await assert.rejects(adapter.sendPrompt('session-1', 'request-1', 'Task prompt'), error => error === failure);
+  assert.deepEqual(observed.request, {
+    sessionId: 'session-1',
+    requestId: 'request-1',
+    mode: 'queue',
+    content: [{ type: 'text', text: 'Task prompt' }],
+  });
+  assert.ok(observed.signal instanceof AbortSignal);
+});
+
 test('session lookup uses the installed SessionSummary sessionId field', async () => {
   let listCalls = 0;
   const services = {
