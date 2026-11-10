@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-redmine",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "Read-only Redmine dispatcher with native DSH workspaces and sessions",
@@ -16,6 +16,8 @@
     "dist/",
     "cordis.patch.yml",
     "README.md",
+    "locale/en.json",
+    "package-detail.md",
     "CHANGELOG.md",
     "books/COMPATIBILITY.md",
     "books/REDMINE_ENDPOINTS.md"
