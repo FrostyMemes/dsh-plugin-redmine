@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-redmine",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Read-only Redmine dispatcher with native DSH workspaces and sessions",
@@ -44,7 +44,7 @@
   },
   "engines": {
     "dsh": "*",
-    "node": ">=22"
+    "node": ">=24.9.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
@@ -62,13 +62,13 @@
     "zod": "4.6.6"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "4.0.5",
-    "@deepseek-ai/dsh-api-session-controller": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-credentials": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-storage-domain": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-typert-registry": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-workspace": "0.2.1-rc.5",
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-api-session-controller": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-credentials": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-storage-domain": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-typert-registry": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-workspace": "0.2.2-rc.1",
     "@playwright/mcp": "0.0.83",
     "@types/node": "22.10.2",
     "@types/react": "18.3.12",
