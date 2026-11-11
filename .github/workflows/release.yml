@@ -1,0 +1,104 @@
+# Releases are built from master only. Bump the version in package.json
+# and package-lock.json before merging the next release.
+name: Publish DSH plugin
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dsh-plugin-redmine-release-master
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, test and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24.21.0'
+          package-manager-cache: false
+
+      - name: Validate package version
+        id: version
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+          if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(pkg.version)) {
+            throw new Error('package.json version must be valid SemVer');
+          }
+          if (lock.version !== pkg.version || lock.packages?.['']?.version !== pkg.version) {
+            throw new Error('Synchronize package-lock.json with package.json before releasing');
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'tag=v' + pkg.version + '\n');
+          NODE
+
+      - name: Check whether version is already published
+        id: release_check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Skipping publication."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG exists without a published release. Resolve manually."
+            exit 1
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.release_check.outputs.publish == 'true'
+        run: npm ci --legacy-peer-deps --ignore-scripts
+
+      - name: Build and run tests
+        if: steps.release_check.outputs.publish == 'true'
+        run: npm test
+
+      - name: Package DSH plugin
+        if: steps.release_check.outputs.publish == 'true'
+        shell: bash
+        run: |
+          mkdir -p release
+          npm pack --pack-destination release
+          ARCHIVE="$(find release -maxdepth 1 -name '*.tgz' -print -quit)"
+          test -n "$ARCHIVE"
+          tar -tzf "$ARCHIVE" > release/contents.txt
+          for path in package/dist/host/index.js package/dist/client/index.js package/cordis.patch.yml; do
+            grep -Fxq "$path" release/contents.txt || {
+              echo "::error::Missing $path in packed plugin"
+              exit 1
+            }
+          done
+
+      - name: Publish GitHub release
+        if: steps.release_check.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" release/*.tgz \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes
