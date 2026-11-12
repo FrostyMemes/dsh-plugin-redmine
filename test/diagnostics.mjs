@@ -33,10 +33,10 @@ test('build importer records real TypeScript diagnostics without source excerpts
     const consume = (...args) => imported.push(args);
     assert.equal(await importer(artifactPath, consume), true);
     assert.equal(await importer(artifactPath, consume), false);
-    assert.ok(imported.some(([level, component, operation]) => level === 'error' && component === 'typescript' && operation === 'TS2322'));
+    const importedTypeError = imported.find(([level, component, operation, , fields]) => level === 'error' && component === 'typescript' && operation === 'TS2322' && fields?.path === 'sample.ts');
+    assert.ok(importedTypeError);
     assert.ok(imported.some(([, , operation, message]) => operation === 'typecheck' && message === 'TypeScript check failed'));
     assert.equal(imported.length, formatted.artifact.diagnostics.length + 1);
-    assert.ok(imported[0][4].path === 'sample.ts');
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
